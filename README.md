@@ -115,6 +115,9 @@ This captures the annual influenza cycle and prepares the data for ARIMA-type mo
 
 ---
 
+<img width="870" height="487" alt="Screenshot 2026-03-13 at 2 30 24 PM" src="https://github.com/user-attachments/assets/f61209be-b76e-4dad-b0b2-921d4af33a15" />
+
+
 ### 4. Model Construction
 
 Several candidate models are evaluated, including:
@@ -152,6 +155,9 @@ Additional model details:
 - log-likelihood = −569.38  
 
 ---
+<img width="865" height="486" alt="Screenshot 2026-03-13 at 2 30 43 PM" src="https://github.com/user-attachments/assets/de562410-1623-4398-9599-5d0e43431967" />
+
+<img width="852" height="490" alt="Screenshot 2026-03-13 at 2 30 49 PM" src="https://github.com/user-attachments/assets/1d1287a3-0c6c-4062-8b3e-687483e0951c" />
 
 ## COVID Structural Adjustment
 
