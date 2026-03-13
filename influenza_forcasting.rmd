@@ -1,0 +1,2840 @@
+---
+title: "Final Project - Infuenza Forecast"
+output:
+  html_document:
+    df_print: paged
+---
+
+# 1. Exploratory Data Analysis
+
+```{r}
+# Install required packages
+library(dplyr)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(forecast)
+library(tidyr)
+library(strucchange)
+library(tseries)
+library(urca)
+library(MuMIn)
+```
+
+```{r}
+# Importing the data
+df <- read.csv("Influenza_Surveillance_Weekly_-_Historical_20260302.csv",
+               stringsAsFactors = FALSE)
+
+names(df)
+head(df[, c("MMWR_WEEK","WEEK_START","WEEK_END",
+            "LAB_FLU_PCT_POSITIVE","INFLUENZA_SEASON")])
+```
+
+## Data Cleaning
+
+```{r}
+# Convert LAB_FLU_PCT_POSITIVE from percent string to numeric
+df = df %>%
+  mutate(
+    LAB_FLU_PCT_POSITIVE = gsub("%", "", LAB_FLU_PCT_POSITIVE),
+    LAB_FLU_PCT_POSITIVE = as.numeric(LAB_FLU_PCT_POSITIVE)
+  )
+
+```
+
+Remove the % sign, convert to numeric, and optionally keep as percent (e.g., 11.61) or convert to fraction (0.1161).
+
+```{r}
+# Parse dates and sort - Convert WEEK_START to Date and sort so the series is strictly ordered 
+df = df %>%
+  mutate(WEEK_START = mdy(WEEK_START)) %>%  # format is MM/DD/YYYY in our dataset
+  arrange(WEEK_START)
+
+# Checking
+head(df[, c("MMWR_WEEK","WEEK_START","WEEK_END",
+            "LAB_FLU_PCT_POSITIVE","INFLUENZA_SEASON", "FLU_RISK_LEVEL")])
+```
+
+```{r}
+# Checking for duplicates
+n_rows = nrow(df)
+n_unique_weeks = dplyr::n_distinct(df$WEEK_START)
+
+n_rows
+n_unique_weeks
+```
+
+No duplicates
+
+```{r}
+# Time duration of the data
+min_date = min(df$WEEK_START, na.rm = TRUE)
+max_date = max(df$WEEK_START, na.rm = TRUE)
+
+min_date
+max_date
+```
+
+```{r}
+# Checking the gap between consecutive WEEK_START dates
+df %>%
+  arrange(WEEK_START) %>%
+  mutate(diff_days = as.numeric(WEEK_START - dplyr::lag(WEEK_START))) %>%
+  count(diff_days)
+```
+
+The gap between consecutive WEEK_START dates is 7 days for 466 transitions and 14 days for exactly one transition The very first row has no previous week to subtract from, so the lag is NA and thus diff_days is NA once.
+
+```{r}
+# Checking missing values in our target variable
+sum(is.na(df$LAB_FLU_PCT_POSITIVE))
+```
+
+0 missing values
+
+## Weekly Visualization
+
+```{r}
+# Keeping things clean
+df_eda <- df %>%
+  mutate(
+    WEEK_START = as.Date(WEEK_START),  # ensure Date
+    LAB_FLU_PCT_POSITIVE = as.numeric(LAB_FLU_PCT_POSITIVE)
+  ) %>%
+  select(WEEK_START,
+         LAB_FLU_PCT_POSITIVE,
+         INFLUENZA_SEASON,
+         FLU_RISK_LEVEL) %>%
+  arrange(WEEK_START)
+
+```
+
+```{r}
+ggplot(df_eda,
+       aes(x = WEEK_START, y = LAB_FLU_PCT_POSITIVE)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Weekly % Influenza Lab Positive (2015–2024)",
+       x = "Week start",
+       y = "% positive") +
+  theme_minimal()
+```
+
+Clear winter peaks each season and low summer baseline. Around 2020–2021, the series drops to near zero for extended periods, consistent with COVID‑era suppression of influenza.
+
+```{r}
+# Seasonal pattern by week of year
+df_eda_season <- df_eda %>%
+  mutate(
+    year = year(WEEK_START),
+    week_iso = isoweek(WEEK_START)
+  )
+
+ggplot(df_eda_season,
+       aes(x = week_iso,
+           y = LAB_FLU_PCT_POSITIVE,
+           group = year,
+           color = factor(year))) +
+  geom_line(alpha = 0.5) +
+  labs(title = "Seasonal pattern of % positive by ISO week",
+       x = "ISO week of year",
+       y = "% positive",
+       color = "Year") +
+  theme_minimal()
+```
+
+Most seasons show a rise in late fall, peak in winter, and decline in spring, confirming strong annual seasonality (\~52‑week period).
+
+Some seasons (e.g., pandemic years) have much lower peaks or altered shapes.
+
+```{r}
+# Distribution of weekly % positive
+ggplot(df_eda,
+       aes(x = LAB_FLU_PCT_POSITIVE)) +
+  geom_histogram(bins = 30,
+                 fill = "steelblue",
+                 color = "white") +
+  labs(title = "Distribution of weekly % influenza positive",
+       x = "% positive",
+       y = "Number of weeks") +
+  theme_minimal()
+```
+
+Many weeks have very low % positive and relatively few weeks show very high values, giving a right‑skewed distribution.
+
+This skewness is part of the motivation for considering a Box‑Cox transform later.
+
+```{r}
+# Color by risk level or season
+ggplot(df_eda,
+       aes(x = WEEK_START, y = LAB_FLU_PCT_POSITIVE,
+           color = INFLUENZA_SEASON)) +
+  geom_line() +
+  labs(title = "Weekly % positive by influenza season",
+       x = "Week start",
+       y = "% positive",
+       color = "Season") +
+  theme_minimal()
+```
+
+## STL Decomposition
+
+```{r}
+# Create ts object: frequency = 52 weeks
+df_ts = ts(df_eda$LAB_FLU_PCT_POSITIVE, frequency = 52)
+
+# Verify
+start(df_ts)
+end(df_ts)
+frequency(df_ts)
+```
+
+```{r}
+# Robust STL with periodic seasonal window (good for forecasting)
+stl_fit <- stl(df_ts, s.window = "periodic", robust = TRUE)
+
+# Plot (built-in)
+plot(stl_fit)
+```
+
+```{r}
+# Extract components as matrix, then data frame
+stl_trend <- stl_fit$time.series[, "trend"]
+stl_seasonal <- stl_fit$time.series[, "seasonal"] 
+stl_remainder <- stl_fit$time.series[, "remainder"]
+
+# Create data frame with time index
+stl_df <- data.frame(
+  time = 1:length(df_ts),
+  original = as.numeric(df_ts),
+  trend = as.numeric(stl_trend),
+  seasonal = as.numeric(stl_seasonal),
+  remainder = as.numeric(stl_remainder)
+)
+```
+
+```{r}
+# Trend
+ggplot(stl_df, aes(x = time, y = trend)) +
+  geom_line(color = "darkblue", linewidth = 1.2) +
+  labs(title = "STL Trend Component",
+       x = "Week",
+       y = "Trend") +
+  theme_minimal()
+
+# Seasonal
+ggplot(stl_df, aes(x = time, y = seasonal)) +
+  geom_line(color = "darkgreen") +
+  labs(title = "STL Seasonal Component (52-week cycle)",
+       x = "Week",
+       y = "Seasonal") +
+  theme_minimal()
+
+# Remainder
+ggplot(stl_df, aes(x = time, y = remainder)) +
+  geom_line(color = "red", alpha = 0.7) +
+  labs(title = "STL Remainder",
+       x = "Week",
+       y = "Remainder") +
+  theme_minimal()
+```
+
+STL Decomposition (period = 52 weeks):
+
+Trend: shows the long‑run baseline level of influenza circulation, with a notable collapse around 2020–2021 followed by partial recovery.
+
+Seasonal: strong annual cycle peaking in winter (weeks \~1–15) and near‑zero in summer (weeks \~25–40), confirming the 52‑week periodicity assumption.
+
+Remainder: relatively small outside pandemic years, indicating good decomposition fit
+
+```{r}
+# All combined
+ggplot(stl_df) +
+  geom_line(aes(x = time, y = original), color = "black") +
+  geom_line(aes(x = time, y = trend + seasonal), 
+            color = "blue", linetype = "dashed") +
+  labs(title = "Original (black) vs Reconstructed (blue dashed)",
+       x = "Week", y = "% Positive") +
+  theme_minimal()
+```
+
+```{r}
+# Adding dates back for easier interpretation
+stl_df_dates <- stl_df %>%
+  mutate(date = df_eda$WEEK_START[1:nrow(stl_df)])
+
+# Check key periods
+head(stl_df_dates, 10)
+tail(stl_df_dates, 10)
+```
+
+## Structural Break Analysis
+
+```{r}
+# Create COVID break indicator
+df_eda <- df_eda %>%
+  mutate(
+    covid_period = ifelse(WEEK_START >= as.Date("2020-03-01"), 
+                         "Post-COVID", "Pre-COVID")
+  )
+
+# Plot with break line
+ggplot(df_eda, aes(x = WEEK_START, y = LAB_FLU_PCT_POSITIVE, 
+                   color = covid_period)) +
+  geom_vline(xintercept = as.Date("2020-03-01"), 
+             linetype = "dashed", color = "red", linewidth = 1) +
+  geom_line() +
+  labs(title = "Weekly % Positive with COVID Break (Mar 2020)",
+       x = "Week start", 
+       y = "% positive",
+       color = "Period") +
+  theme_minimal()
+```
+
+```{r}
+# Pre/post averages
+df_eda %>%
+  mutate(covid_period = ifelse(WEEK_START >= as.Date("2020-03-01"), 
+                              "Post-COVID", "Pre-COVID")) %>%
+  group_by(covid_period) %>%
+  summarise(
+    n_weeks = n(),
+    mean_pct = mean(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    sd_pct = sd(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    median_pct = median(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    max_pct = max(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+This table will show dramatically lower means and peak values post‑2020, confirming the structural shift
+
+```{r}
+# Convert to ts for breakpoints()
+df_ts = ts(df_eda$LAB_FLU_PCT_POSITIVE, frequency = 52)
+
+# Test for breaks in mean (intercept only)
+bp_mean = breakpoints(df_ts ~ 1, h = 0.15, breaks = 3)
+summary(bp_mean)
+
+# Plot breakpoints
+plot(bp_mean)
+```
+
+breakpoints() finds 1–3 change points automatically. We see one major break around 2020 ± a few months. The h = 0.15 sets minimum segment length (\~15% of data).
+
+```{r}
+# Compare pre/post break averages
+# Use breakpoints to split data
+break_dates <- df_eda$WEEK_START[bp_mean$breakpoints]
+break_dates
+
+# Example: compare segments (adjust indices based on your bp_mean output)
+pre_break <- df_eda$LAB_FLU_PCT_POSITIVE[1:bp_mean$breakpoints[1]]
+post_break <- df_eda$LAB_FLU_PCT_POSITIVE[(bp_mean$breakpoints[1]+1):length(df_eda$LAB_FLU_PCT_POSITIVE)]
+
+t.test(pre_break, post_break)
+```
+
+**Structural Break Analysis**
+
+The time series suggests a structural change around March 2020, coinciding with the onset of the COVID-19 pandemic. Prior to this point, influenza activity exhibits strong and regular seasonal peaks, whereas post-COVID seasons show substantially lower and more irregular peaks.
+
+To formally examine whether the overall level of the series changed after this break, we conducted a Welch two-sample t-test comparing the pre- and post-break periods. The test yields a p-value of 0.968, indicating no statistically significant difference in the mean influenza positivity rate between the two periods.
+
+This result suggests that the structural change is not primarily driven by a shift in the overall mean level of the series, but rather by changes in seasonal dynamics and peak intensity. Therefore, we incorporate a COVID intervention dummy in the subsequent time series models to account for this structural disruption.
+
+## Box-Cox Transformation & Stationarity Tests
+
+```{r}
+# Original series
+df_original = df_eda$LAB_FLU_PCT_POSITIVE
+
+# Add small constant to make positive (common for % positive series)
+eps <- 1e-6
+min_point <- min(as.numeric(df_original), na.rm = TRUE)
+c_shift <- max(0, eps - min_point)
+#c_shift = 0.0001
+df_positive = df_original + c_shift
+```
+
+```{r}
+c_shift
+```
+
+```{r}
+# Estimate lambda
+lambda_bc = BoxCox.lambda(df_positive)
+lambda_bc
+```
+
+```{r}
+# Transform
+df_boxcox <- BoxCox(df_positive, lambda = lambda_bc)
+```
+
+```{r}
+# Plots for comparison
+plot(df_eda$WEEK_START, df_original, type = "l", 
+     main = "Original Series", xlab = "Week", ylab = "% Positive")
+plot(df_eda$WEEK_START, df_boxcox, type = "l", 
+     main = paste("Box-Cox transformed (λ =", round(lambda_bc, 3), ")"),
+     xlab = "Week", ylab = "Transformed")
+```
+
+slightly concave transformation to stabilize variance of peaks
+
+```{r}
+# Convert to ts
+y_ts <- ts(df_original, frequency = 52)
+y_bc_ts <- ts(df_boxcox, frequency = 52)
+
+# ADF test (H0: unit root / non-stationary)
+adf_orig <- adf.test(y_ts, alternative = "stationary")
+adf_bc <- adf.test(y_bc_ts, alternative = "stationary")
+
+# KPSS test (H0: stationary)
+kpss_orig <- kpss.test(y_ts)
+kpss_bc <- kpss.test(y_bc_ts)
+
+# Summary table
+results <- data.frame(
+  Test = c("ADF (orig)", "ADF (Box-Cox)", "KPSS (orig)", "KPSS (Box-Cox)"),
+  Statistic = c(adf_orig$statistic, adf_bc$statistic, 
+                kpss_orig$statistic, kpss_bc$statistic),
+  P_value = c(adf_orig$p.value, adf_bc$p.value,
+              kpss_orig$p.value, kpss_bc$p.value)
+)
+print(results)
+```
+
+The original influenza positivity series exhibits strong seasonal peaks and increasing variance during epidemic periods, suggesting potential heteroscedasticity. To stabilize the variance and improve model suitability, a Box–Cox transformation was applied with an estimated parameter λ = 0.362.
+
+After transformation, the magnitude of the seasonal peaks becomes more balanced and the variance across time appears more stable. This helps reduce the influence of extreme epidemic spikes while preserving the underlying seasonal structure of the series.
+
+Stationarity tests further support the adequacy of the transformation. The Augmented Dickey–Fuller (ADF) test rejects the null hypothesis of a unit root (p = 0.01), while the KPSS test fails to reject the null of stationarity (p ≈ 0.08–0.09). Together, these results suggest that the transformed series is approximately stationary in level, providing a suitable basis for subsequent ARIMA-based modeling.
+
+## Monthly Aggregation for Robustness
+
+```{r}
+# Add month column and aggregate
+df_monthly <- df_eda %>%
+  mutate(month_start = floor_date(WEEK_START, "month")) %>%
+  group_by(month_start) %>%
+  summarise(
+    LAB_FLU_PCT_POSITIVE_monthly = mean(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    n_weeks = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(month_start)
+
+# Verify
+head(df_monthly)
+nrow(df_monthly)
+```
+
+```{r}
+# Monthly time series plot
+ggplot(df_monthly, aes(x = month_start, y = LAB_FLU_PCT_POSITIVE_monthly)) +
+  geom_line(color = "darkred") +
+  geom_point(color = "darkred") +
+  labs(title = "Monthly mean % Influenza Lab Positive (2015–2024)",
+       x = "Month",
+       y = "Monthly mean % positive") +
+  theme_minimal()
+```
+
+```{r}
+# STL on monthly data (frequency = 12)
+df_monthly_ts <- ts(df_monthly$LAB_FLU_PCT_POSITIVE_monthly, frequency = 12)
+stl_monthly <- stl(df_monthly_ts, s.window = "periodic", robust = TRUE)
+plot(stl_monthly)
+```
+
+```{r}
+# Pre/post‑COVID comparison (monthly)
+df_monthly <- df_monthly %>%
+  mutate(covid_period = ifelse(month_start >= as.Date("2020-03-01"), 
+                              "Post-COVID", "Pre-COVID"))
+
+df_monthly %>%
+  group_by(covid_period) %>%
+  summarise(
+    mean_monthly = mean(LAB_FLU_PCT_POSITIVE_monthly, na.rm = TRUE),
+    n_months = n(),
+    .groups = "drop"
+  )
+```
+
+## Differencing and Weekly ACF/PACF
+
+```{r}
+# Convert to ts
+y_ts     <- ts(df_original, frequency = 52)
+y_pos_ts <- ts(df_positive, frequency = 52)   
+y_bc_ts  <- ts(df_boxcox, frequency = 52)
+y_model <- y_pos_ts
+m <- 52
+
+d_suggest <- ndiffs(y_bc_ts)
+D_suggest <- nsdiffs(y_bc_ts, m = m)
+
+y_diff <- y_model
+if (D_suggest > 0) y_diff <- diff(y_diff, lag = m, differences = D_suggest)
+if (d_suggest > 0) y_diff <- diff(y_diff, differences = d_suggest)
+
+Acf(y_diff, lag.max = 3*m, main = "ACF (after differencing)")
+Pacf(y_diff, lag.max = 3*m, main = "PACF (after differencing)")
+```
+
+The ACF shows very strong correlation at lag 1 and then slowly decreases over the next several lags. This gradual decline means the series has momentum. Weekly flu levels are strongly related to the previous weeks rather than changing randomly. The ACF also shows clear repeating patterns around lag 52 and again near 104 and 156. This confirms strong yearly seasonality. Flu this week is related to flu in the same period last year.
+
+The PACF shows one very large spike at lag 1 and then most values fall within the confidence bands. This pattern is typical of an AR1 process. It tells us that once we account for last week, additional recent lags do not add much extra information. There is also a noticeable spike at lag 52, which suggests a seasonal autoregressive effect. Together these patterns support a SARIMA model with one regular AR term and one seasonal AR term. This makes sense because flu spreads gradually week to week and also follows a strong yearly cycle.
+
+Training and testing split (the last 52 weeks)
+
+```{r}
+h <- 52
+n <- length(y_model)
+
+train <- window(y_model, end = time(y_model)[n - h])
+test  <- window(y_model, start = time(y_model)[n - h + 1])
+
+covid_dummy <- ifelse(df_eda$WEEK_START >= as.Date("2020-03-01"), 1, 0)
+xreg_full  <- ts(covid_dummy, frequency = 52)
+xreg_train <- window(xreg_full, end = time(y_model)[n - h])
+xreg_test  <- window(xreg_full, start = time(y_model)[n - h + 1])
+
+```
+
+The weekly influenza time series is divided into two parts to properly evaluate forecasting performance. The last 52 weeks, representing one full flu season, are set aside as a test set, while all earlier observations are used as the training set. This approach allows the model to be estimated using historical data and then assessed on its ability to predict an entire future year of influenza activity.
+
+At the same time, a COVID dummy variable is created that equals 0 before March 1, 2020 and 1 afterward. This variable is important because influenza activity dropped sharply during the COVID period due to lockdowns, masking, and behavioral changes. That drop represents a structural break rather than normal seasonal variation. Without controlling for this shift, the model might misinterpret the unusually low COVID-era flu levels as part of the regular pattern, which could distort forecasts. Including the COVID dummy helps separate typical flu dynamics from the pandemic shock, resulting in more realistic and
+
+# 2. SARIMA
+
+## Manual SARIMA Candidates
+
+```{r}
+
+AICc_manual <- function(fit) {
+  n <- length(residuals(fit))
+  k <- length(fit$coef) + 1   # +1 for variance parameter
+  aic <- AIC(fit)
+  aic + (2 * k * (k + 1)) / (n - k - 1)
+}
+
+candidates <- list(
+  list(name="M1", order=c(1,d_suggest,1), seasonal=c(1,D_suggest,1)),
+  list(name="M2", order=c(2,d_suggest,1), seasonal=c(1,D_suggest,1)),
+  list(name="M3", order=c(1,d_suggest,2), seasonal=c(1,D_suggest,1)),
+  list(name="M4", order=c(2,d_suggest,2), seasonal=c(1,D_suggest,1))
+)
+
+fit_one <- function(spec) {
+  
+  fit <- Arima(
+    train,
+    order = spec$order,
+    seasonal = list(order = spec$seasonal, period = m),
+    include.constant = TRUE,
+    xreg = xreg_train,
+    method = "CSS-ML",
+    lambda = lambda_bc,
+    biasadj = TRUE
+  )
+  
+  fc  <- forecast(fit, h = h, xreg = xreg_test)
+  acc <- accuracy(fc, test)
+  
+  lb <- Box.test(residuals(fit),
+                 lag = 2*m,
+                 type = "Ljung-Box",
+                 fitdf = length(fit$coef))
+  
+  data.frame(
+    model = spec$name,
+    order = paste0("(", paste(spec$order, collapse=","), ")"),
+    seasonal = paste0("(", paste(spec$seasonal, collapse=","), ")[52]"),
+    AIC  = AIC(fit),
+    AICc = AICc_manual(fit),
+    BIC  = BIC(fit),
+    RMSE = acc["Test set","RMSE"],
+    MAE  = acc["Test set","MAE"],
+    LjungBox_p = lb$p.value
+  )
+}
+
+manual_results <- bind_rows(lapply(candidates, fit_one)) %>%
+  arrange(AICc)
+
+print(manual_results)
+```
+
+The table compares four SARIMA model specifications (M1–M4) using information criteria and forecast accuracy metrics. Model M4 (SARIMA (2,0,2)(1,1,1)[52]) performs best overall, as it has the lowest AIC (1050.60), AICc (1051.04), and BIC (1085.67), indicating the strongest balance between model fit and complexity. Although M3 has a slightly lower RMSE (2.53) than M4 (2.59), M4 still maintains competitive prediction accuracy while achieving substantially better information criteria. Additionally, M4 has the highest Ljung–Box p-value (0.075), suggesting that the residuals resemble white noise and the model adequately captures the underlying temporal structure. In contrast, the other models have extremely small Ljung–Box p-values, indicating remaining autocorrelation in the residuals. Overall, these results support selecting M4 as the preferred SARIMA model for forecasting influenza positivity rates.
+
+## AUTO.ARIMA Comparison
+
+```{r}
+auto_fit <- auto.arima(
+  train,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE,  
+  max.p = 2, max.q = 2,   
+  max.P = 1, max.Q = 1,   
+  xreg = xreg_train,
+  method = "CSS-ML",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+
+auto_fc  <- forecast(auto_fit, h = h, xreg = xreg_test)
+auto_acc <- accuracy(auto_fc, test)
+
+auto_lb <- Box.test(
+  residuals(auto_fit),
+  lag = 2*m,
+  type = "Ljung-Box",
+  fitdf = length(auto_fit$coef)
+)
+
+ao <- arimaorder(auto_fit)
+
+auto_summary <- data.frame(
+  model = "AUTO",
+  order = paste0("(", paste(ao[c("p","d","q")], collapse=","), ")"),
+  seasonal = paste0("(", paste(ao[c("P","D","Q")], collapse=","), ")[52]"),
+  AIC  = AIC(auto_fit),
+  AICc = AICc_manual(auto_fit),
+  BIC  = BIC(auto_fit),
+  RMSE = auto_acc["Test set","RMSE"],
+  MAE  = auto_acc["Test set","MAE"],
+  LjungBox_p = auto_lb$p.value
+)
+
+print(auto_summary)
+```
+
+The auto.arima model was used as a benchmark to compare against the manually specified SARIMA models. To keep computation reasonable and aligned with the data patterns observed in the ACF and PACF plots, the search space was restricted to small non seasonal orders with max p and q set to 2, and small seasonal orders with max P and Q set to 1. This decision is justified because the PACF showed a strong spike at lag 1 and then quickly dropped off, suggesting a low order AR structure, and there was only one clear seasonal spike at lag 52, suggesting at most one seasonal AR term. There was no evidence in the plots that higher order terms were necessary. Restricting the search prevents the model from trying overly complex specifications that are not supported by the data and helps avoid overfitting while significantly improving computation time.
+
+## Selecting the best model
+
+```{r}
+
+all_results <- bind_rows(manual_results, auto_summary) %>%
+  arrange(AICc)
+
+print(all_results)
+
+best_model_name <- all_results$model[1]
+
+```
+
+The table compares several SARIMA model specifications along with an automatically selected model using information criteria, forecast accuracy metrics, and residual diagnostics. Model M4 (SARIMA (2,0,2)(1,1,1)[52]) remains the strongest candidate, as it produces the lowest AIC (1050.60), AICc (1051.04), and BIC (1085.67) among all models, indicating the best balance between goodness-of-fit and model complexity. It also shows strong predictive performance with RMSE = 2.59 and MAE = 1.51, while its Ljung–Box p-value of 0.075 suggests the residuals are close to white noise, indicating that most temporal dependence has been captured. Although M3 achieves a slightly lower RMSE, its much smaller Ljung–Box p-value indicates remaining autocorrelation in the residuals. The AUTO model performs substantially worse, with much higher AIC, RMSE, and MAE values, suggesting poorer fit and forecasting accuracy. Overall, the results confirm that M4 provides the best overall model for forecasting influenza positivity rates.
+
+## Refitting the final model on the full dataset
+
+```{r}
+if (best_model_name == "AUTO") {
+  
+  fit_final <- auto.arima(
+    y_model,
+    seasonal = TRUE,
+    stepwise = FALSE,
+    approximation = FALSE,
+    xreg = xreg_full,
+    method = "CSS-ML",
+    lambda = lambda_bc,
+    biasadj = TRUE
+  )
+  
+} else {
+  
+  chosen_spec <- candidates[[ which(sapply(candidates, `[[`, "name") == best_model_name) ]]
+  
+  fit_final <- Arima(
+    y_model,
+    order = chosen_spec$order,
+    seasonal = list(order = chosen_spec$seasonal, period = m),
+    include.constant = TRUE,
+    xreg = xreg_full,
+    method = "CSS-ML",
+    lambda = lambda_bc,
+    biasadj = TRUE
+  )
+}
+
+summary(fit_final)
+
+
+```
+
+The final model is refit on the full weekly dataset after selecting the best specification, ARIMA(2,0,2)(1,1,1)[52], with the COVID dummy included as an external regressor. Refitting on all observations allows the model to utilize the complete historical record of influenza activity before generating forecasts.
+
+The estimated coefficients indicate strong short-term dynamics in the series. The AR terms (ar1 = 1.7095, ar2 = −0.7515) suggest substantial persistence in weekly influenza levels, meaning current values are strongly influenced by recent weeks. The moving average components (ma1 = −1.1002, ma2 = 0.4204) capture short-term shock adjustments in the series. Seasonal components sar1 = −0.0229 and sma1 = −0.8677 represent the annual influenza cycle with a 52-week seasonal period. The COVID external regressor coefficient (−1.5792) indicates that influenza positivity rates were significantly lower during the pandemic period after accounting for normal seasonal patterns.
+
+The residual variance (σ² = 0.7747) suggests moderate unexplained variability after modeling the temporal structure. Training error metrics show RMSE = 2.14 and MAE = 1.10, indicating relatively small in-sample forecast errors. The mean error is close to zero (−0.22), suggesting no systematic bias in the predictions. Overall, the model effectively captures weekly persistence, annual seasonality, and the pandemic shock, making it well suited for forecasting weekly influenza activity.
+
+## Residual Diagnostics
+
+```{r}
+checkresiduals(fit_final)
+```
+
+The residual diagnostics indicate that the model captures most of the structure in the data but not all of it. The residual series fluctuates around zero with no clear trend, suggesting that the main patterns in weekly influenza activity have been removed. The histogram is roughly bell shaped and centered near zero, indicating approximate normality, though a few larger spikes remain.
+
+The residual ACF shows that most autocorrelations lie within the confidence bands, meaning remaining correlations are relatively small. The Ljung–Box test produces a p-value of 0.06698, which is greater than the 0.05 significance level, meaning we fail to reject the null hypothesis of no residual autocorrelation. This indicates that the residuals behave approximately like white noise and that the ARIMA(2,0,2)(1,1,1)[52] model adequately captures the temporal dependence in the data. Although minor residual correlations may still appear due to the complexity of influenza dynamics, the diagnostic results suggest that the model successfully explains the main short-term and seasonal patterns in weekly influenza activity.
+
+## Forecasting the next 52 weeks
+
+```{r}
+future_xreg <- ts(rep(1, h), frequency = 52)
+
+fc_final <- forecast(fit_final, h = 52, xreg = future_xreg)
+
+autoplot(fc_final) +
+  labs(title = "Final Weekly Influenza Forecast (Next 52 Weeks)",
+       x = "Time",
+       y = "Transformed % Positive") +
+  theme_minimal()
+```
+
+The final 52 week forecast shows that weekly influenza activity is expected to follow a typical seasonal pattern, with a rise during the upcoming winter period and a gradual decline afterward. The blue line represents the predicted values, while the shaded bands show uncertainty intervals, which widen further into the future, reflecting increasing forecast uncertainty. The model anticipates a moderate seasonal peak rather than an extreme surge, consistent with historical patterns captured by the SARIMA specification.
+
+## Monthly Robustness Check
+
+```{r}
+y_month <- ts(df_monthly$LAB_FLU_PCT_POSITIVE_monthly, frequency = 12)
+
+use_boxcox_month <- TRUE
+eps <- 1e-3
+min_train <- min(as.numeric(y_month), na.rm = TRUE)
+shift_month <- max(0, eps - y_month)
+
+if (use_boxcox_month) {
+  y_month_pos <- df_monthly$LAB_FLU_PCT_POSITIVE_monthly + shift_month
+  lambda_m <- BoxCox.lambda(y_month_pos)
+  y_month_model <- ts(y_month_pos, frequency = 12)
+} else {
+  lambda_m <- NA
+  y_month_model <- y_month
+}
+```
+
+```{r}
+shift_month
+```
+
+#### Differencing + monthly ACF/PACF
+
+```{r}
+m_m <- 12
+d_m <- ndiffs(y_month_model)
+D_m <- nsdiffs(y_month_model, m = m_m)
+
+y_m_diff <- y_month_model
+if (D_m > 0) y_m_diff <- diff(y_m_diff, lag = m_m, differences = D_m)
+if (d_m > 0) y_m_diff <- diff(y_m_diff, differences = d_m)
+
+Acf(y_m_diff, lag.max = 3*m_m, main = "Monthly ACF (after differencing)")
+Pacf(y_m_diff, lag.max = 3*m_m, main = "Monthly PACF (after differencing)")
+
+```
+
+The monthly robustness check reveals patterns similar to those observed in the weekly analysis, although the series appears smoother due to the lower frequency of aggregation. In the monthly ACF, there is a strong spike at lag 1 followed by a gradual decay, indicating that influenza activity in a given month remains highly correlated with the previous month. This mirrors the weekly results, where strong short-term persistence was observed between consecutive weeks. The monthly ACF also shows clear seasonal spikes around lags 12 and 24, confirming a yearly seasonal cycle in the data. This aligns with the weekly ACF, where prominent spikes appeared around lags 52 and 104, corresponding to annual seasonality measured in weeks.
+
+The monthly PACF shows one dominant spike at lag 1, with most other values falling within the confidence bands, suggesting a relatively low-order autoregressive structure. This pattern is consistent with the weekly PACF, which also displayed a strong lag-1 effect. Small seasonal spikes near lag 12 in the monthly PACF further reinforce the presence of annual seasonality, analogous to the seasonal spike at lag 52 in the weekly PACF. Overall, the monthly results support the findings from the weekly analysis: influenza activity exhibits strong short-term persistence and a clear annual seasonal cycle, reinforcing the robustness of the SARIMA modeling approach across different time scales.
+
+Train/test split (last 12 months)
+
+```{r}
+h_m <- 12
+n_m <- length(y_month_model)
+
+train_m <- window(y_month_model, end = time(y_month_model)[n_m - h_m])
+test_m  <- window(y_month_model, start = time(y_month_model)[n_m - h_m + 1])
+
+covid_dummy_m <- ifelse(df_monthly$month_start >= as.Date("2020-03-01"), 1, 0)
+xreg_m_full  <- ts(covid_dummy_m, frequency = 12)
+xreg_m_train <- window(xreg_m_full, end = time(y_month_model)[n_m - h_m])
+xreg_m_test  <- window(xreg_m_full, start = time(y_month_model)[n_m - h_m + 1])
+```
+
+#### Manual monthly SARIMA candidates
+
+```{r}
+candidates_m <- list(
+  list(name="MM1", order=c(1,d_m,1), seasonal=c(1,D_m,1)),
+  list(name="MM2", order=c(2,d_m,1), seasonal=c(1,D_m,1)),
+  list(name="MM3", order=c(1,d_m,2), seasonal=c(1,D_m,1)),
+  list(name="MM4", order=c(1,d_m,1), seasonal=c(1,D_m,0))
+)
+
+fit_one_m <- function(spec) {
+
+  fit <- Arima(
+    train_m,
+    order = spec$order,
+    seasonal = list(order = spec$seasonal, period = 12),
+    include.constant = TRUE,
+    xreg = xreg_m_train,
+    method = "CSS-ML",
+    lambda = lambda_m,
+    biasadj = TRUE
+  )
+
+  fc  <- forecast(fit, h = h_m, xreg = xreg_m_test)
+  acc <- accuracy(fc, test_m)
+
+  lb <- Box.test(
+    residuals(fit),
+    lag = 2*m_m,
+    type = "Ljung-Box",
+    fitdf = length(fit$coef)
+  )
+
+  data.frame(
+    model = spec$name,
+    order = paste0("(", paste(spec$order, collapse=","), ")"),
+    seasonal = paste0("(", paste(spec$seasonal, collapse=","), ")[12]"),
+    AIC  = AIC(fit),
+    AICc = AICc_manual(fit),
+    BIC  = BIC(fit),
+    RMSE = acc["Test set","RMSE"],
+    MAE  = acc["Test set","MAE"],
+    LjungBox_p = lb$p.value
+  )
+}
+
+monthly_manual_results <- bind_rows(lapply(candidates_m, fit_one_m)) %>%
+  arrange(AICc)
+
+print(monthly_manual_results)
+```
+
+The monthly manual SARIMA comparison shows that MM2 (ARIMA(2,0,1)(1,0,1)[12]) provides the best overall fit, with the lowest AIC (330.65) and AICc (332.31) among the candidate models. The other specifications perform similarly but slightly worse, with AICc values of 334.36 for MM1, 335.16 for MM4, and 336.74 for MM3, indicating that all models capture the main structure of the data but MM2 offers the best balance between fit and complexity.
+
+In terms of forecast performance, the models produce very similar error metrics. MM3 has the lowest RMSE (4.10), while MM2 achieves the lowest MAE (2.74), suggesting that predictive accuracy differences across models are small. Importantly, all models have Ljung–Box p-values well above 0.05 (ranging from 0.055 to 0.366), indicating that residual autocorrelation is not statistically significant and the models adequately capture the temporal dependence in the series. Compared with the weekly models, the monthly specifications exhibit cleaner residual diagnostics, likely because monthly aggregation smooths short-term fluctuations. Overall, MM2 provides a reasonable and defensible specification for the monthly robustness check.
+
+#### Monthly AUTO.ARIMA
+
+```{r}
+auto_m <- auto.arima(
+  train_m,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE,
+  max.p = 2, max.q = 2,
+  max.P = 1, max.Q = 1,
+  xreg = xreg_m_train,
+  method = "CSS-ML",
+  lambda = lambda_m,
+  biasadj = TRUE
+)
+
+auto_m_fc  <- forecast(auto_m, h = h_m, xreg = xreg_m_test)
+auto_m_acc <- accuracy(auto_m_fc, test_m)
+
+auto_m_lb <- Box.test(
+  residuals(auto_m),
+  lag = 2*m_m,
+  type = "Ljung-Box",
+  fitdf = length(auto_m$coef)
+)
+
+ao_m <- arimaorder(auto_m)
+
+monthly_auto_summary <- data.frame(
+  model = "AUTO_M",
+  order = paste0("(", paste(ao_m[c("p","d","q")], collapse=","), ")"),
+  seasonal = paste0("(", paste(ao_m[c("P","D","Q")], collapse=","), ")[12]"),
+  AIC  = AIC(auto_m),
+  AICc = AICc_manual(auto_m),
+  BIC  = BIC(auto_m),
+  RMSE = auto_m_acc["Test set","RMSE"],
+  MAE  = auto_m_acc["Test set","MAE"],
+  LjungBox_p = auto_m_lb$p.value
+)
+
+print(monthly_auto_summary)
+```
+
+The automatic monthly SARIMA selection identifies ARIMA(1,0,0)(0,1,1)[12] as the preferred specification. The model achieves an AIC of 301.21 and an AICc of 301.65, indicating a good balance between model fit and complexity. In terms of predictive performance, the model produces an RMSE of 2.63 and an MAE of 1.79, suggesting reasonably accurate forecasts for the aggregated monthly series.
+
+The Ljung–Box p-value of 0.3898 indicates that the residuals do not exhibit significant autocorrelation, meaning the model adequately captures the main temporal structure in the data. Compared with the weekly models, the monthly model benefits from smoother dynamics due to aggregation, which reduces short-term volatility. Overall, the automatic SARIMA specification provides a parsimonious and statistically adequate model for the monthly robustness check, reinforcing the presence of stable seasonal patterns in influenza activity.
+
+#### Compare monthly models
+
+```{r}
+monthly_all <- bind_rows(monthly_manual_results, monthly_auto_summary) %>%
+  arrange(AICc)
+
+print(monthly_all)
+```
+
+When comparing the monthly models, the AUTO_M model (ARIMA(1,0,0)(0,1,1)[12]) clearly performs best according to the information criteria. It has the lowest AIC (301.21), AICc (301.65), and BIC (310.93) among all specifications. These values are substantially lower than those of the manually specified models, whose AICc values range from about 332.31 to 336.74 and whose BIC values are all above 349. Because AIC, AICc, and BIC all penalize model complexity while rewarding goodness of fit, the fact that AUTO_M is lowest on all three measures indicates that it provides the most parsimonious and statistically efficient representation of the monthly influenza series.
+
+In terms of forecast performance, the differences across models are relatively small but show a slightly different ranking. The manual models have RMSE values around 4.10–4.41 and MAE values between 2.73 and 3.03, whereas the AUTO_M model achieves substantially lower forecast errors with RMSE = 2.63 and MAE = 1.79. This suggests that the automatic specification not only fits the data better according to information criteria but also produces more accurate forecasts for the monthly series. Additionally, all Ljung–Box p-values are above 0.05, ranging from 0.055 to 0.390, indicating that residual autocorrelation is not statistically significant for any of the models. Overall, the AUTO_M model provides the strongest overall performance for the monthly robustness analysis, combining the best information criteria, lower forecast errors, and well-behaved residual diagnostics.
+
+#### Refit best monthly model on full monthly data + diagnostics
+
+```{r}
+best_month_name <- monthly_all$model[1]
+
+if (best_month_name == "AUTO_M") {
+
+  fit_month_final <- auto.arima(
+    y_month_model,
+    seasonal = TRUE,
+    stepwise = TRUE,
+    approximation = TRUE,
+    max.p = 2, max.q = 2,
+    max.P = 1, max.Q = 1,
+    xreg = xreg_m_full,
+    method = "CSS-ML",
+    lambda = lambda_m,
+    biasadj = TRUE
+  )
+
+} else {
+
+  chosen_m <- candidates_m[[ which(sapply(candidates_m, `[[`, "name") == best_month_name) ]]
+
+  fit_month_final <- Arima(
+    y_month_model,
+    order = chosen_m$order,
+    seasonal = list(order = chosen_m$seasonal, period = 12),
+    include.constant = TRUE,
+    xreg = xreg_m_full,
+    method = "CSS-M",
+    lambda = lambda_m,
+  )
+}
+
+summary(fit_month_final)
+
+```
+
+The best monthly model selected is ARIMA(1,0,0)(0,1,1)[12] with the COVID dummy included as an external regressor. This specification is relatively parsimonious, containing one regular autoregressive term and one seasonal moving-average term, which is consistent with the patterns observed in the ACF and PACF diagnostics. The AR(1) coefficient (0.7115) indicates substantial month-to-month persistence, meaning current influenza levels are strongly influenced by the previous month’s activity. The seasonal MA(1) coefficient (−0.7170) captures adjustments in the annual seasonal cycle after seasonal differencing.
+
+The COVID dummy coefficient (−3.2261) suggests that influenza activity was significantly lower during the pandemic period even after controlling for normal seasonal behavior. The model also includes a small positive drift term (0.0339), reflecting a slight long-run trend in the differenced series. Overall, this relatively simple specification effectively captures the main temporal structure of the monthly influenza data, including short-term persistence, annual seasonality, and the pandemic-related shock.
+
+#### Residual Diagnostics
+
+```{r}
+checkresiduals(fit_month_final)
+```
+
+The monthly residual diagnostics indicate that the ARIMA(1,0,0)(0,1,1)[12] model provides a good fit to the data. The residual variance is σ² = 0.655, with a log-likelihood of −117.57. The corresponding information criteria are AIC = 243.14, AICc = 243.58, and BIC = 253.40, suggesting a parsimonious model that balances fit and complexity. Training error measures are relatively small, with RMSE = 0.751 and MAE = 0.549, and the mean error is close to zero, indicating little systematic bias in the fitted values.
+
+The residual time series fluctuates randomly around zero without any visible trend or seasonal pattern, suggesting that the model successfully removes the main temporal structure in the monthly influenza data. The histogram of residuals appears roughly bell-shaped and centered near zero, indicating approximate normality.
+
+The residual ACF shows that nearly all autocorrelations lie within the confidence bounds, indicating minimal remaining dependence between months. This is further confirmed by the \*Ljung–Box test (Q = 19.02, p-value = 0.5205)\*\*, which is well above the 0.05 significance level. Therefore, we fail to reject the null hypothesis of no residual autocorrelation. Overall, the diagnostics suggest that the monthly specification adequately captures short-term persistence, annual seasonality, and the COVID-related structural change, supporting the robustness of the monthly modeling results.
+
+#### Forecast next 12 months
+
+```{r}
+future_xreg_m <- ts(rep(1, h_m), frequency = 12)
+
+fc_month_final <- forecast(fit_month_final, h = h_m, xreg = future_xreg_m)
+
+autoplot(fc_month_final) +
+  labs(
+    title = "Monthly Influenza Forecast (Next 12 Months)",
+    x = "Time",
+    y = ifelse(use_boxcox_month, "Transformed monthly mean % positive", "Monthly mean % positive")
+  ) +
+  theme_minimal()
+```
+
+The graph presents the monthly influenza positivity rate along with a 12-month forecast and prediction intervals. The historical data (black line) shows clear seasonal influenza cycles, with sharp winter peaks followed by rapid declines to near-zero levels during the summer months. The forecast (blue line) projects a moderate increase in influenza activity in the coming winter, reaching a peak of roughly 10–15% positivity before declining again, which is consistent with historical seasonal patterns. However, the prediction intervals (shaded blue regions) widen substantially as the forecast horizon increases, indicating growing uncertainty in longer-term predictions. This large uncertainty band suggests that while the model captures the general seasonal behavior of influenza, the exact magnitude of future outbreaks remains difficult to predict. Overall, the forecast indicates a likely seasonal resurgence of influenza but with considerable variability around the expected peak.
+
+# 3. SARIMA - Forecasting & Backtesting + Time Series Cross-Validation
+
+## Weekly Forecasts
+
+```{r Model_Comparison}
+# ----------------------------
+# SARIMA M3
+# ----------------------------
+Best_Arima <- Arima(
+  train,
+  order = c(2, d_suggest, 2),
+  seasonal = list(order = c(1, D_suggest, 1), period = m),
+  include.constant = TRUE,
+  xreg = xreg_train,
+  method = "CSS-ML",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+
+Best_Arima_fit  <- forecast(Best_Arima, h = h, xreg = xreg_test)
+acc_arima <- accuracy(Best_Arima_fit, test)["Test set", c("RMSE","MAE","MAPE")]
+
+# ----------------------------
+# STL + ETS (supports freq=52)
+# ----------------------------
+fc_stlf  <- stlf(
+  train,
+  h = h,
+  method = "ets",
+  robust = TRUE,
+  lambda = lambda_bc
+)
+acc_stlf <- accuracy(fc_stlf, test)["Test set", c("RMSE","MAE","MAPE")]
+
+# stlf stores the fitted model here (usually an ets model)
+stlf_model <- fc_stlf$model
+
+# ----------------------------
+# Naive + Seasonal Naive
+# ----------------------------
+fc_naive   <- naive(train, h = h, lambda = lambda_bc)
+acc_naive  <- accuracy(fc_naive, test)["Test set", c("RMSE","MAE","MAPE")]
+
+fc_snaive  <- snaive(train, h = h, lambda = lambda_bc)
+acc_snaive <- accuracy(fc_snaive, test)["Test set", c("RMSE","MAE","MAPE")]
+
+# ----------------------------
+# AICc / BIC (NA where undefined)
+# ----------------------------
+aicc_vals <- c(
+  AICc(Best_Arima),
+  if (!is.null(stlf_model) && inherits(stlf_model, "ets")) AICc(stlf_model) else NA_real_,
+  NA_real_,
+  NA_real_
+)
+
+bic_vals <- c(
+  BIC(Best_Arima),
+  if (!is.null(stlf_model) && inherits(stlf_model, "ets")) BIC(stlf_model) else NA_real_,
+  NA_real_,
+  NA_real_
+)
+
+# ----------------------------
+# Comparison Table
+# ----------------------------
+comparison <- data.frame(
+  Model = c("SARIMA + xreg", "STL+ETS (stlf)", "Naive", "Seasonal Naive"),
+  AICc  = aicc_vals,
+  BIC   = bic_vals,
+  RMSE  = as.numeric(c(acc_arima["RMSE"],  acc_stlf["RMSE"],  acc_naive["RMSE"],  acc_snaive["RMSE"])),
+  MAE   = as.numeric(c(acc_arima["MAE"],   acc_stlf["MAE"],   acc_naive["MAE"],   acc_snaive["MAE"])),
+  MAPE  = as.numeric(c(acc_arima["MAPE"],  acc_stlf["MAPE"],  acc_naive["MAPE"],  acc_snaive["MAPE"]))
+) %>%
+  arrange(RMSE)
+
+print(comparison)
+```
+
+```{r}
+# Forecast means (NO Box-Cox)
+sarima_mean     <- as.numeric(Best_Arima_fit$mean)
+ets_mean    <- as.numeric(fc_stlf$mean)
+naive_mean  <- as.numeric(fc_naive$mean)
+snaive_mean <- as.numeric(fc_snaive$mean)
+
+# Actual test values
+actual <- df_eda$LAB_FLU_PCT_POSITIVE[(nrow(df_eda)-h+1):nrow(df_eda)]
+
+# Dates for plotting
+test_dates <- df_eda$WEEK_START[(nrow(df_eda)-h+1):nrow(df_eda)]
+
+plot_df <- data.frame(
+  Date = test_dates,
+  Actual = actual,
+  SARIMA = sarima_mean,
+  ETS = ets_mean,
+  Naive = naive_mean,
+  SeasonalNaive = snaive_mean
+)
+
+plot_df_long <- plot_df %>%
+  pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+ggplot(plot_df_long, aes(x = Date, y = Value, color = Series)) +
+  geom_line(linewidth = 1) +   # linewidth is preferred over size for lines
+  scale_color_manual(
+    values = c(
+      "Actual" = "black",
+      "SARIMA" = "green",
+      "ETS" = "#d95f02",
+      "Naive" = "#377eb8",
+      "SeasonalNaive" = "#7570b3"
+    )
+  ) +
+  labs(
+    title = "Weekly Influenza Forecast Comparison (Test Period)",
+    x = "Week",
+    y = "% Influenza Positive",
+    color = "Series"
+  ) +
+  theme_minimal()
+```
+
+The graph compares several forecasting models against the actual weekly influenza positivity rate during the test period from October 2023 to October 2024. The actual data (black line) shows a typical seasonal flu pattern, rising through late fall, peaking around January at roughly 14–15%, and then gradually declining through spring before reaching near-zero levels by summer. Among the models, SARIMA (green) tracks the overall seasonal pattern most closely, capturing the timing of the rise and decline, although it underestimates the peak intensity. ETS (orange) follows the general trend but produces several exaggerated spikes in February and March, indicating instability and overreaction to short-term fluctuations. The Naive model (blue) remains almost flat and fails to capture the seasonal dynamics entirely. The Seasonal Naive model (purple) dramatically overestimates the early winter peak and then collapses to near zero, showing that simply repeating last year’s seasonal pattern performs poorly when seasonal timing shifts. Overall, SARIMA provides the most reliable forecast among the models, as it captures the seasonal structure while maintaining relatively stable predictions.
+
+```{r}
+# Forecast
+future_xreg <- ts(rep(1, 52), frequency = 52)
+ARIMA_future <- forecast(Best_Arima_fit, h = 52, xreg = future_xreg)
+
+# Plot original + forecast
+autoplot(ARIMA_future) +
+  labs(
+    title="SARIMA Forecast (Next 52 Weeks)",
+    x="Time",
+    y="% Influenza Positive"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+fc_ets_future <- forecast(fc_stlf, h = 52)
+
+# Plot original history + forecast
+autoplot(fc_ets_future) +
+  labs(
+    title = "ETS Forecast (Next 52 Weeks)",
+    x = "Time",
+    y = "% Influenza Positive"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+fc_naive_future <- naive(y_model, h = 52)
+
+# Plot
+autoplot(fc_naive_future) +
+  labs(
+    title = "Naive Forecast (Next 52 Weeks)",
+    x = "Time",
+    y = "% Influenza Positive"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+fc_snaive_future <- snaive(y_model, h = 52)
+
+# Plot original data + forecast
+autoplot(fc_snaive_future) +
+  labs(
+    title = "Seasonal Naive Forecast (Next 52 Weeks)",
+    x = "Time",
+    y = "% Influenza Positive"
+  ) +
+  theme_minimal()
+```
+
+## Monthly Forecasts
+
+```{r}
+library(forecast)
+
+# =========================
+# 1. ARIMA 
+# =========================
+auto_m <- auto.arima(
+  train_m,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE,
+  max.p = 2, max.q = 2,
+  max.P = 1, max.Q = 1,
+  xreg = xreg_m_train,
+  method = "CSS-ML",
+  lambda = lambda_m,
+  biasadj = TRUE
+)
+
+auto_m_fc  <- forecast(auto_m, h = h_m, xreg = xreg_m_test)
+auto_m_acc <- accuracy(auto_m_fc, test_m)
+
+
+# =========================
+# 2. ETS
+# =========================
+ets_m <- ets(
+  train_m,
+  lambda = lambda_m,
+  biasadj = TRUE
+)
+
+ets_m_fc  <- forecast(ets_m, h = h_m)
+ets_m_acc <- accuracy(ets_m_fc, test_m)
+
+
+# =========================
+# 3. Naive
+# =========================
+naive_m_fc  <- naive(train_m, h = h_m)
+naive_m_acc <- accuracy(naive_m_fc, test_m)
+
+
+# =========================
+# 4. Seasonal Naive
+# =========================
+snaive_m_fc  <- snaive(train_m, h = h_m)
+snaive_m_acc <- accuracy(snaive_m_fc, test_m)
+
+
+# =========================
+# 5. Extract RMSE MAE MAPE
+# =========================
+get_metrics <- function(acc){
+  acc["Test set", c("RMSE","MAE","MAPE")]
+}
+
+metrics <- rbind(
+  ARIMA  = get_metrics(auto_m_acc),
+  ETS    = get_metrics(ets_m_acc),
+  Naive  = get_metrics(naive_m_acc),
+  SNaive = get_metrics(snaive_acc <- snaive_m_acc)
+)
+
+
+# =========================
+# 6. Add AICc and BIC
+# =========================
+metrics <- cbind(
+  AICc = c(AICc(auto_m), AICc(ets_m), NA, NA),
+  BIC  = c(BIC(auto_m),  BIC(ets_m),  NA, NA),
+  metrics
+)
+
+metrics
+```
+
+```{r}
+
+# Forecast means (original scale already)
+sarima_mean  <- as.numeric(auto_m_fc$mean)
+ets_mean     <- as.numeric(ets_m_fc$mean)
+naive_mean   <- as.numeric(naive_m_fc$mean)
+snaive_mean  <- as.numeric(snaive_m_fc$mean)
+
+df_month <- df_eda %>%
+  mutate(month = floor_date(WEEK_START, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    flu = mean(LAB_FLU_PCT_POSITIVE, na.rm = TRUE)
+  )
+# Actual test values (match your df_month pattern)
+h <- h_m  # just to keep your original variable name style
+actual <- df_month$flu[(nrow(df_month) - h + 1):nrow(df_month)]
+
+# Dates for plotting
+test_dates <- df_month$month[(nrow(df_month) - h + 1):nrow(df_month)]
+
+# Build plotting df
+plot_df <- data.frame(
+  Date         = test_dates,
+  Actual       = actual,
+  SARIMA       = sarima_mean,
+  ETS          = ets_mean,
+  Naive        = naive_mean,
+  SeasonalNaive= snaive_mean
+)
+
+plot_df_long <- plot_df %>%
+  pivot_longer(-Date, names_to = "Series", values_to = "Value")
+
+ggplot(plot_df_long, aes(x = Date, y = Value, color = Series)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = c(
+      "Actual" = "black",
+      "SARIMA" = "green",
+      "ETS" = "#d95f02",
+      "Naive" = "#377eb8",
+      "SeasonalNaive" = "#7570b3"
+    )
+  ) +
+  labs(
+    title = "Monthly Influenza Forecast Comparison",
+    x = "Month",
+    y = "% Influenza Positive",
+    color = "Series"
+  ) +
+  theme_minimal()
+```
+
+The figure compares the monthly influenza positivity forecasts from several models (ETS, Naive, SARIMA, and Seasonal Naive) against the actual observed values. The actual influenza positivity rate rises sharply in late 2023, peaks around December, and then gradually declines through 2024. Among the models, SARIMA follows the overall shape of the observed pattern most closely, capturing both the rise and subsequent decline, although it slightly underestimates the peak. The ETS model substantially overestimates influenza activity, especially in early 2024, producing forecasts far above the actual values. Meanwhile, the Naive and Seasonal Naive models perform poorly, either remaining nearly flat or producing unrealistic spikes, indicating they fail to capture the underlying seasonal dynamics. Overall, the comparison suggests that SARIMA provides the most realistic forecast among the tested models.
+
+## Cross-Validation - Expanding Window
+
+```{r, warning=FALSE}
+# =========================================================
+# Rolling RMSE (cumulative) — Expanding window (Best_Arima spec)
+# IMPORTANT: keeps your order / seasonal order / lambda / biasadj
+# =========================================================
+expanding_rollrmse_BestArima <- function(y, xreg,
+                                         m = 52,
+                                         order = c(2,0,2),
+                                         seas_order = c(1,1,1),
+                                         horizons = c(4,8,12),
+                                         initial = NULL,
+                                         include.constant = TRUE,
+                                         lambda = NULL,
+                                         biasadj = TRUE,
+                                         method = "CSS",
+                                         dates = NULL) {
+  hmax <- max(horizons)
+  n <- length(y)
+  if (is.null(initial)) initial <- floor(0.6 * n)
+
+  origins <- initial:(n - hmax)
+  n_origins <- length(origins)
+  if (n_origins <= 0) stop("Not enough data for chosen initial window and horizon.")
+
+  se_mat <- matrix(NA_real_, nrow = n_origins, ncol = length(horizons))
+  colnames(se_mat) <- paste0("h", horizons)
+
+  pb <- txtProgressBar(min = 0, max = n_origins, style = 3)
+
+  # helper: slice xreg correctly whether vector or matrix/data.frame/ts
+  x_slice <- function(X, idx) {
+    if (is.null(dim(X))) return(X[idx])
+    X[idx, , drop = FALSE]
+  }
+
+  for (k in seq_along(origins)) {
+    i <- origins[k]
+
+    y_tr <- y[1:i]
+    x_tr <- x_slice(xreg, 1:i)
+    x_te <- x_slice(xreg, (i+1):(i+hmax))
+
+    fit <- tryCatch(
+      Arima(
+        y_tr,
+        order = order,
+        seasonal = list(order = seas_order, period = m),
+        include.constant = include.constant,
+        xreg = x_tr,
+        method = method,
+        lambda = lambda,
+        biasadj = biasadj
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) { setTxtProgressBar(pb, k); next }
+
+    fc <- tryCatch(forecast(fit, h = hmax, xreg = x_te), error = function(e) NULL)
+    if (is.null(fc)) { setTxtProgressBar(pb, k); next }
+
+    for (j in seq_along(horizons)) {
+      h <- horizons[j]
+      se_mat[k, j] <- (fc$mean[h] - y[i + h])^2
+    }
+
+    setTxtProgressBar(pb, k)
+  }
+  close(pb)
+
+  # NA-robust cumulative rolling RMSE
+  roll_rmse_mat <- apply(se_mat, 2, function(col) {
+    n_ok <- cumsum(!is.na(col))
+    s_ok <- cumsum(replace(col, is.na(col), 0))
+    out <- sqrt(s_ok / n_ok)
+    out[n_ok == 0] <- NA_real_
+    out
+  })
+
+  origin_x <- if (!is.null(dates)) dates[origins] else origins
+
+  as.data.frame(roll_rmse_mat) %>%
+    mutate(Origin = origin_x, Window = "Expanding") %>%
+    pivot_longer(cols = starts_with("h"), names_to = "H", values_to = "RMSE") %>%
+    mutate(Horizon = as.integer(sub("^h", "", H))) %>%
+    select(Origin, Window, Horizon, RMSE)
+}
+
+# =========================================================
+# Rolling RMSE (cumulative) — Sliding window (Best_Arima spec)
+# IMPORTANT: keeps your order / seasonal order / lambda / biasadj
+# =========================================================
+sliding_rollrmse_BestArima <- function(y, xreg,
+                                       m = 52,
+                                       order = c(2,0,2),
+                                       seas_order = c(1,1,1),
+                                       horizons = c(4,8,12),
+                                       window_size = NULL,
+                                       include.constant = TRUE,
+                                       lambda = NULL,
+                                       biasadj = TRUE,
+                                       method = "CSS",
+                                       dates = NULL) {
+  hmax <- max(horizons)
+  n <- length(y)
+  if (is.null(window_size)) window_size <- floor(0.6 * n)
+
+  origins <- window_size:(n - hmax)
+  n_origins <- length(origins)
+  if (n_origins <= 0) stop("Not enough data for chosen window size and horizon.")
+
+  se_mat <- matrix(NA_real_, nrow = n_origins, ncol = length(horizons))
+  colnames(se_mat) <- paste0("h", horizons)
+
+  pb <- txtProgressBar(min = 0, max = n_origins, style = 3)
+
+  x_slice <- function(X, idx) {
+    if (is.null(dim(X))) return(X[idx])
+    X[idx, , drop = FALSE]
+  }
+
+  for (k in seq_along(origins)) {
+    i <- origins[k]
+    start_i <- i - window_size + 1
+
+    y_tr <- y[start_i:i]
+    x_tr <- x_slice(xreg, start_i:i)
+    x_te <- x_slice(xreg, (i+1):(i+hmax))
+
+    fit <- tryCatch(
+      Arima(
+        y_tr,
+        order = order,
+        seasonal = list(order = seas_order, period = m),
+        include.constant = include.constant,
+        xreg = x_tr,
+        method = method,
+        lambda = lambda,
+        biasadj = biasadj
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) { setTxtProgressBar(pb, k); next }
+
+    fc <- tryCatch(forecast(fit, h = hmax, xreg = x_te), error = function(e) NULL)
+    if (is.null(fc)) { setTxtProgressBar(pb, k); next }
+
+    for (j in seq_along(horizons)) {
+      h <- horizons[j]
+      se_mat[k, j] <- (fc$mean[h] - y[i + h])^2
+    }
+
+    setTxtProgressBar(pb, k)
+  }
+  close(pb)
+
+  roll_rmse_mat <- apply(se_mat, 2, function(col) {
+    n_ok <- cumsum(!is.na(col))
+    s_ok <- cumsum(replace(col, is.na(col), 0))
+    out <- sqrt(s_ok / n_ok)
+    out[n_ok == 0] <- NA_real_
+    out
+  })
+
+  origin_x <- if (!is.null(dates)) dates[origins] else origins
+
+  as.data.frame(roll_rmse_mat) %>%
+    mutate(Origin = origin_x, Window = "Sliding") %>%
+    pivot_longer(cols = starts_with("h"), names_to = "H", values_to = "RMSE") %>%
+    mutate(Horizon = as.integer(sub("^h", "", H))) %>%
+    select(Origin, Window, Horizon, RMSE)
+}
+
+# =========================
+# Run + plot both together
+# =========================
+roll_exp <- expanding_rollrmse_BestArima(
+  y = y_model,
+  xreg = xreg_full,
+  m = 52,
+  order = c(2, d_suggest, 2),
+  seas_order = c(1, D_suggest, 1),
+  horizons = c(4, 8, 12),
+  initial = floor(0.6 * length(y_model)),
+  include.constant = TRUE,
+  lambda = lambda_bc,
+  biasadj = TRUE,
+  method = "CSS",
+  dates = NULL
+)
+
+roll_sld <- sliding_rollrmse_BestArima(
+  y = y_model,
+  xreg = xreg_full,
+  m = 52,
+  order = c(2, d_suggest, 2),
+  seas_order = c(1, D_suggest, 1),
+  horizons = c(4, 8, 12),
+  window_size = floor(0.6 * length(y_model)),
+  include.constant = TRUE,
+  lambda = lambda_bc,
+  biasadj = TRUE,
+  method = "CSS",
+  dates = NULL
+)
+
+roll_all <- bind_rows(roll_exp, roll_sld)
+```
+
+```{r}
+# =========================================================
+# Cell 1) Rolling stability (smoothed RMSE) — uses roll_all
+# =========================================================
+k <- 26  # smoothing window in origins
+
+roll_all %>%
+  mutate(Method = if ("Method" %in% names(.)) Method else Window,
+         OriginIndex = if ("OriginIndex" %in% names(.)) OriginIndex else Origin) %>%
+  group_by(Method, Horizon) %>%
+  arrange(OriginIndex, .by_group = TRUE) %>%
+  mutate(RMSE_smooth = zoo::rollmean(RMSE, k = k, fill = NA, align = "right")) %>%
+  ggplot(aes(x = OriginIndex, y = RMSE_smooth, color = Method)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  facet_wrap(~ Horizon, scales = "free_y") +
+  labs(
+    title = paste0("Rolling RMSE Stability (smoothed over ", k, " origins)"),
+    x = "Rolling origin (end of training window)",
+    y = "Smoothed cumulative RMSE"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+roll_all %>%
+  mutate(Method = if ("Method" %in% names(.)) Method else Window,
+         OriginIndex = if ("OriginIndex" %in% names(.)) OriginIndex else Origin) %>%
+  ggplot(aes(x = OriginIndex, y = RMSE, color = Method)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  facet_wrap(~ Horizon, scales = "free_y") +
+  labs(
+    title = "Cumulative RMSE Convergence (Robustness of CV Estimates)",
+    x = "Rolling origin (end of training window)",
+    y = "Cumulative RMSE"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+cv_rmse <- roll_all %>%
+  mutate(Method = if ("Method" %in% names(.)) Method else Window,
+         OriginIndex = if ("OriginIndex" %in% names(.)) OriginIndex else Origin) %>%
+  group_by(Method, Horizon) %>%
+  arrange(OriginIndex, .by_group = TRUE) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  select(Method, Horizon, CV_RMSE = RMSE)
+
+ggplot(cv_rmse, aes(x = factor(Horizon), y = CV_RMSE, fill = Method)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  labs(
+    title = "Cross-Validation RMSE (Final Cumulative): Expanding vs Sliding",
+    x = "Forecast horizon (weeks ahead)",
+    y = "CV RMSE",
+    fill = "Method"
+  ) +
+  theme_minimal()
+```
+
+```{r, warning=FALSE}
+
+make_cv_err_all_from_spec <- function(y, xreg,
+                                      m = 52,
+                                      order = c(2,0,2),
+                                      seas_order = c(1,1,1),
+                                      horizons = c(4,8,12),
+                                      initial = NULL,
+                                      window_size = NULL,
+                                      include.constant = TRUE,
+                                      lambda = NULL,
+                                      biasadj = TRUE,
+                                      method = "CSS") {
+
+  hmax <- max(horizons)
+  n <- length(y)
+  if (is.null(initial)) initial <- floor(0.6 * n)
+  if (is.null(window_size)) window_size <- floor(0.6 * n)
+
+  x_slice <- function(X, idx) {
+    if (is.null(dim(X))) return(X[idx])
+    X[idx, , drop = FALSE]
+  }
+
+  out <- list()
+
+  # Expanding
+  origins_exp <- initial:(n - hmax)
+  for (i in origins_exp) {
+    fit <- tryCatch(
+      Arima(y[1:i],
+            order = order,
+            seasonal = list(order = seas_order, period = m),
+            include.constant = include.constant,
+            xreg = x_slice(xreg, 1:i),
+            method = method,
+            lambda = lambda,
+            biasadj = biasadj),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+
+    fc <- tryCatch(forecast(fit, h = hmax, xreg = x_slice(xreg, (i+1):(i+hmax))),
+                   error = function(e) NULL)
+    if (is.null(fc)) next
+
+    for (h in horizons) {
+      err <- as.numeric(fc$mean[h] - y[i + h])
+      out[[length(out)+1]] <- data.frame(Method="Expanding", OriginIndex=i, Horizon=h,
+                                         Error=err, SqError=err^2)
+    }
+  }
+
+  # Sliding
+  origins_sld <- window_size:(n - hmax)
+  for (i in origins_sld) {
+    start_i <- i - window_size + 1
+
+    fit <- tryCatch(
+      Arima(y[start_i:i],
+            order = order,
+            seasonal = list(order = seas_order, period = m),
+            include.constant = include.constant,
+            xreg = x_slice(xreg, start_i:i),
+            method = method,
+            lambda = lambda,
+            biasadj = biasadj),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) next
+
+    fc <- tryCatch(forecast(fit, h = hmax, xreg = x_slice(xreg, (i+1):(i+hmax))),
+                   error = function(e) NULL)
+    if (is.null(fc)) next
+
+    for (h in horizons) {
+      err <- as.numeric(fc$mean[h] - y[i + h])
+      out[[length(out)+1]] <- data.frame(Method="Sliding", OriginIndex=i, Horizon=h,
+                                         Error=err, SqError=err^2)
+    }
+  }
+
+  bind_rows(out)
+}
+
+cv_err_all <- make_cv_err_all_from_spec(
+  y = y_model,
+  xreg = xreg_full,
+  m = 52,
+  order = c(2, d_suggest, 2),
+  seas_order = c(1, D_suggest, 1),
+  horizons = c(4,8,12),
+  initial = floor(0.6 * length(y_model)),
+  window_size = floor(0.6 * length(y_model)),
+  include.constant = TRUE,
+  lambda = lambda_bc,
+  biasadj = TRUE,
+  method = "CSS"
+)
+
+cv_err_all %>%
+  mutate(AbsError = abs(Error)) %>%
+  ggplot(aes(x = factor(Horizon), y = AbsError, fill = Method)) +
+  geom_boxplot(outlier.alpha = 0.25, position = position_dodge(width = 0.8)) +
+  labs(
+    title = "Absolute Forecast Error Distribution by Horizon",
+    x = "Horizon (weeks ahead)",
+    y = "|Forecast error|",
+    fill = "Method"
+  ) +
+  theme_minimal()
+```
+
+Rolling RMSE Stability (Smoothed over 26 origins) The rolling RMSE plot evaluates how forecast accuracy evolves across different training windows when using a SARIMA model augmented with a COVID dummy variable. Forecast errors increase sharply during certain periods, likely reflecting structural disruptions in influenza patterns during and after the pandemic. Across all horizons, the sliding window approach consistently exhibits slightly higher rolling RMSE than the expanding window approach, indicating that including the full historical series improves stability. This suggests that long-term seasonal structure remains valuable for influenza forecasting even when accounting for the COVID shock through the dummy variable.
+
+Cumulative RMSE Convergence (Robustness of CV Estimates) The cumulative RMSE curves show how forecast error estimates stabilize as additional rolling forecast origins are incorporated. Early values fluctuate due to limited evaluation points, but the curves gradually converge as more forecasts are included. For all horizons, the expanding window consistently maintains lower cumulative RMSE than the sliding window, indicating that using the full historical dataset leads to more reliable and stable performance. This result suggests that the SARIMA model benefits from longer historical context when modeling influenza dynamics alongside the COVID dummy.
+
+Cross-Validation RMSE Comparison (Final Cumulative) The bar chart summarizes overall cross-validation performance for the SARIMA model with the COVID dummy across forecast horizons of 4, 8, and 12 weeks. Forecast accuracy decreases as the horizon increases, reflecting the growing uncertainty associated with longer-term predictions. Across all horizons, the expanding window approach produces lower RMSE than the sliding window approach, indicating better predictive accuracy. This suggests that incorporating the full historical dataset improves forecasting performance while the COVID dummy helps capture pandemic-related structural effects.
+
+Absolute Forecast Error Distribution by Horizon The boxplots illustrate the distribution of absolute forecast errors across forecast horizons for both cross-validation strategies. As the horizon increases, both the median error and variability expand, reflecting greater uncertainty in longer-term predictions. The expanding window method generally shows slightly lower median errors and tighter interquartile ranges compared to the sliding window approach, indicating more consistent performance. Several large outliers appear across horizons, likely corresponding to periods where influenza activity deviated substantially from typical seasonal behavior despite the inclusion of the COVID dummy variable.
+
+# 4. Extended Models
+
+Data precessing
+
+```{r}
+############################################
+# Phase 7 - ARIMAX / SARIMAX Extension
+# Weekly main model only
+# Use df (raw, full columns) as the source of truth
+############################################
+
+
+# Function to clean numeric values stored as character/percent strings
+clean_num <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("%", "", x)          # remove percent signs
+  x <- gsub(",", "", x)          # remove commas
+  x <- gsub("NA", "", x, ignore.case = TRUE)
+  x <- gsub("null", "", x, ignore.case = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+# Apply cleaning directly to df
+df <- df %>%
+  dplyr::mutate(
+    ILI_PCT_POSITIVE_ILINET  = clean_num(ILI_PCT_POSITIVE_ILINET),
+    ILI_PCT_POSITIVE_ESSENCE = clean_num(ILI_PCT_POSITIVE_ESSENCE),
+    HOSP_FLU_ICU_WEEKLY      = clean_num(HOSP_FLU_ICU_WEEKLY)
+  )
+
+# Optional: fill missing values (recommended for ARIMAX)
+df <- df %>%
+  dplyr::mutate(
+    ILI_PCT_POSITIVE_ILINET  = forecast::na.interp(ILI_PCT_POSITIVE_ILINET),
+    ILI_PCT_POSITIVE_ESSENCE = forecast::na.interp(ILI_PCT_POSITIVE_ESSENCE),
+    HOSP_FLU_ICU_WEEKLY      = forecast::na.interp(HOSP_FLU_ICU_WEEKLY)
+  )
+
+# Replace any remaining edge NA values with 0
+df$ILI_PCT_POSITIVE_ILINET[is.na(df$ILI_PCT_POSITIVE_ILINET)] <- 0
+df$ILI_PCT_POSITIVE_ESSENCE[is.na(df$ILI_PCT_POSITIVE_ESSENCE)] <- 0
+df$HOSP_FLU_ICU_WEEKLY[is.na(df$HOSP_FLU_ICU_WEEKLY)] <- 0
+
+# --- 0) Safety checks / prep (df is the full dataset) ---
+# Make sure WEEK_START is Date and data is time-ordered
+df$WEEK_START <- as.Date(df$WEEK_START)
+df <- df[order(df$WEEK_START), ]
+
+
+
+# Keep rows where the target exists (consistent with modeling a ts)
+df_full <- subset(df, !is.na(LAB_FLU_PCT_POSITIVE))
+
+# Recreate the target series from df (full) using the already-chosen shift
+# (c_shift was defined earlier in your notebook)
+y_full_pos <- df_full$LAB_FLU_PCT_POSITIVE + c_shift
+y_full_ts  <- ts(y_full_pos, frequency = 52)
+```
+
+```{r}
+# y_model split logic used:
+#   h <- 52; n <- length(y_model)
+#   train end   = time(y_model)[n - h]
+#   test  start = time(y_model)[n - h + 1]
+h <- 52
+n_ref <- length(y_model)
+split_end_time   <- time(y_model)[n_ref - h]
+split_start_time <- time(y_model)[n_ref - h + 1]
+
+# If df_full has extra rows vs y_model (rare), align by taking the last n_ref points
+if (length(y_full_ts) != n_ref) {
+  if (length(y_full_ts) > n_ref) {
+    y_full_ts <- ts(tail(as.numeric(y_full_ts), n_ref), frequency = 52)
+    df_full   <- tail(df_full, n_ref)
+  } else {
+    stop("df_full has fewer observations than y_model; cannot align splits for comparison.")
+  }
+}
+
+train_full <- window(y_full_ts, end   = split_end_time)
+test_full  <- window(y_full_ts, start = split_start_time)
+```
+
+## Pure SARIMA
+
+```{r}
+############################################################
+# Pure SARIMA (no xreg) using auto.arima
+# - Uses the SAME train/test split: train_full / test_full
+# - Weekly frequency = 52
+# - Keeps your Box-Cox lambda (lambda_bc) for consistency
+############################################################
+library(forecast)
+
+fit_sarima_pure_auto <- auto.arima(
+  train_full,
+  seasonal = TRUE,
+  lambda = lambda_bc,
+  max.p = 2, max.q = 2,   
+  max.P = 1, max.Q = 1,   
+  biasadj = TRUE,
+  stepwise = FALSE,
+  approximation = FALSE
+)
+
+fit_sarima_pure_auto
+summary(fit_sarima_pure_auto)
+
+# Forecast
+fc_sarima_pure_auto <- forecast(
+  fit_sarima_pure_auto,
+  h = h
+)
+
+# Accuracy (test set)
+acc_sarima_pure_auto <- accuracy(fc_sarima_pure_auto, test_full)
+acc_sarima_pure_auto
+
+# AICc / BIC
+data.frame(
+  Model = "Pure SARIMA (auto.arima)",
+  AICc = AICc(fit_sarima_pure_auto),
+  BIC  = BIC(fit_sarima_pure_auto)
+)
+
+# Plot: Observed vs Forecast
+library(ggplot2)
+
+actual_df <- data.frame(Time = time(test_full), Actual = as.numeric(test_full))
+forecast_df <- data.frame(Time = time(fc_sarima_pure_auto$mean), Forecast = as.numeric(fc_sarima_pure_auto$mean))
+
+ggplot() +
+  geom_line(data = actual_df, aes(Time, Actual), color = "black", linewidth = 1.2) +
+  geom_line(data = forecast_df, aes(Time, Forecast), color = "blue", linewidth = 1) +
+  labs(
+    title = "Observed vs Forecast: Pure SARIMA (auto.arima)",
+    x = "Time",
+    y = "Flu % Positive"
+  ) +
+  theme_minimal()
+```
+
+## ARIMAX
+
+```{r}
+# --- 2) Build covariates from df (full) ---
+# Required covariates:
+#   - ILINet % positive  -> ILI_PCT_POSITIVE_ILINET
+#   - ESSENCE ED %       -> ILI_PCT_POSITIVE_ESSENCE
+# Suggested extra surveillance indicators (available in this dataset):
+#   - Hospital ICU admissions -> HOSP_FLU_ICU_WEEKLY
+#   - Pediatric deaths        -> PEDIATRIC_DEATHS
+#
+# Also keep the COVID dummy you already used (structural break control).
+
+ 
+
+# COVID dummy (use df_full dates)
+covid_dummy_full <- ifelse(df_full$WEEK_START >= as.Date("2020-03-01"), 1, 0)
+
+# Core exogenous variables
+ilinet_full  <- df_full$ILI_PCT_POSITIVE_ILINET
+essence_full <- df_full$ILI_PCT_POSITIVE_ESSENCE
+
+# Optional extra indicators
+icu_full   <- df_full$HOSP_FLU_ICU_WEEKLY
+peds_full  <- df_full$PEDIATRIC_DEATHS
+
+# Handle missing values in xreg (keep it simple & reproducible)
+# Strategy:
+#   - linear interpolation for internal NAs (forecast::na.interp)
+#   - remaining edge NAs -> 0
+fill_x <- function(x) {
+  x <- as.numeric(x)
+  x <- forecast::na.interp(x)
+  x[is.na(x)] <- 0
+  return(x)
+}
+
+covid_dummy_full <- fill_x(covid_dummy_full)
+ilinet_full      <- fill_x(ilinet_full)
+essence_full     <- fill_x(essence_full)
+icu_full         <- fill_x(icu_full)
+peds_full        <- fill_x(peds_full)
+
+# Convert to ts so window() uses the same time index logic
+covid_ts   <- ts(covid_dummy_full, frequency = 52)
+ilinet_ts  <- ts(ilinet_full,      frequency = 52)
+essence_ts <- ts(essence_full,     frequency = 52)
+icu_ts     <- ts(icu_full,         frequency = 52)
+peds_ts    <- ts(peds_full,        frequency = 52)
+
+# Split covariates using the SAME split points as y_model
+covid_train   <- window(covid_ts,   end   = split_end_time)
+covid_test    <- window(covid_ts,   start = split_start_time)
+
+ilinet_train  <- window(ilinet_ts,  end   = split_end_time)
+ilinet_test   <- window(ilinet_ts,  start = split_start_time)
+
+essence_train <- window(essence_ts, end   = split_end_time)
+essence_test  <- window(essence_ts, start = split_start_time)
+
+icu_train     <- window(icu_ts,     end   = split_end_time)
+icu_test      <- window(icu_ts,     start = split_start_time)
+
+peds_train    <- window(peds_ts,    end   = split_end_time)
+peds_test     <- window(peds_ts,    start = split_start_time)
+```
+
+```{r}
+# --- 3) Define xreg matrices (baseline vs ARIMAX variants) ---
+# Baseline "SARIMA" (your current model) includes ONLY the COVID dummy as xreg
+xreg_base_train <- cbind(covid = as.numeric(covid_train))
+xreg_base_test  <- cbind(covid = as.numeric(covid_test))
+
+# ARIMAX v1: COVID + ILINet + ESSENCE
+xreg_v1_train <- cbind(
+  covid   = as.numeric(covid_train),
+  ilinet  = as.numeric(ilinet_train),
+  essence = as.numeric(essence_train)
+)
+xreg_v1_test <- cbind(
+  covid   = as.numeric(covid_test),
+  ilinet  = as.numeric(ilinet_test),
+  essence = as.numeric(essence_test)
+)
+
+# ARIMAX v2: v1 + ICU + pediatric deaths
+xreg_v2_train <- cbind(
+  covid   = as.numeric(covid_train),
+  ilinet  = as.numeric(ilinet_train),
+  essence = as.numeric(essence_train),
+  icu     = as.numeric(icu_train),
+  peds    = as.numeric(peds_train)
+)
+xreg_v2_test <- cbind(
+  covid   = as.numeric(covid_test),
+  ilinet  = as.numeric(ilinet_test),
+  essence = as.numeric(essence_test),
+  icu     = as.numeric(icu_test),
+  peds    = as.numeric(peds_test)
+)
+```
+
+```{r}
+# --- 4) Fit SARIMAX (ARIMAX) with the SAME SARIMA orders you selected earlier ---
+# You already created:
+#   - chosen_spec$order
+#   - chosen_spec$seasonal
+#   - m (52)
+#   - lambda_bc (Box-Cox lambda)
+#
+# Reminder: Arima(..., xreg=...) is regression with ARIMA errors (ARIMAX/SARIMAX). :contentReference[oaicite:0]{index=0}
+
+fit_sarima_base <- Arima(
+  train_full,
+  order    = chosen_spec$order,
+  seasonal = list(order = chosen_spec$seasonal, period = m),
+  include.constant = TRUE,
+  xreg   = xreg_base_train,
+  method = "CSS-ML",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+
+############################################################
+# ARIMAX v1: COVID + ILINet + ESSENCE
+############################################################
+
+fit_arimax_v1 <- Arima(
+  train_full,
+  order    = chosen_spec$order,
+  seasonal = list(order = chosen_spec$seasonal, period = m),
+  include.constant = TRUE,
+  xreg   = xreg_v1_train,
+  method = "CSS-ML",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+
+
+############################################################
+# ARIMAX v2: v1 + ICU + pediatric deaths
+############################################################
+
+fit_arimax_v2 <- Arima(
+  train_full,
+  order    = chosen_spec$order,
+  seasonal = list(order = chosen_spec$seasonal, period = m),
+  include.constant = TRUE,
+  xreg   = xreg_v2_train,
+  method = "CSS-ML",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+```
+
+```{r}
+# --- 5) Forecast on the same holdout window & compare accuracy ---
+fc_arimax_v1   <- forecast(fit_arimax_v1,   h = h, xreg = xreg_v1_test)
+fc_arimax_v2   <- forecast(fit_arimax_v2,   h = h, xreg = xreg_v2_test)
+
+acc_v1   <- accuracy(fc_arimax_v1,   test_full)
+acc_v2   <- accuracy(fc_arimax_v2,   test_full)
+
+# Helper: keep the "Test set" row only
+get_test_row <- function(acc_mat) {
+  as.data.frame(acc_mat)[2, , drop = FALSE]
+}
+
+cmp <- rbind(
+  data.frame(Model = "ARIMAX v1: COVID + ILINet + ESSENCE", get_test_row(acc_v1)),
+  data.frame(Model = "ARIMAX v2: v1 + ICU + Pediatric deaths", get_test_row(acc_v2))
+)
+
+# Keep the most common metrics in the deliverable
+cmp_out <- cmp[, c("Model", "RMSE", "MAE", "MAPE", "MASE")]
+cmp_out
+```
+
+## TBATS
+
+```{r}
+############################################################
+# TBATS model
+############################################################
+fit_tbats <- tbats(train_full)   # auto estimates seasonality/trend/ARMA errors
+fit_tbats
+```
+
+```{r}
+############################################################
+# TBATS forecast + accuracy
+############################################################
+fc_tbats <- forecast(fit_tbats, h = h)
+
+acc_tbats <- accuracy(fc_tbats, test_full)
+acc_tbats
+```
+
+```{r}
+
+############################################################
+# TBATS forecast accuracy
+############################################################
+
+acc_tbats <- accuracy(fc_tbats, test_full)
+
+tbats_metrics <- data.frame(
+  Model = "TBATS",
+  RMSE = acc_tbats[2,"RMSE"],
+  MAE  = acc_tbats[2,"MAE"],
+  MAPE = acc_tbats[2,"MAPE"],
+  MASE = acc_tbats[2,"MASE"]
+)
+
+tbats_metrics
+```
+
+```{r}
+############################################################
+# Plot: ETS observed vs forecast
+############################################################
+library(ggplot2)
+
+actual_df <- data.frame(
+  Time = time(test_full),
+  Actual = as.numeric(test_full)
+)
+
+tbats_df <- data.frame(
+  Time = time(fc_tbats$mean),
+  Forecast = as.numeric(fc_tbats$mean)
+)
+
+ggplot() +
+  geom_line(data = actual_df, aes(Time, Actual), color = "black", linewidth = 1.2) +
+  geom_line(data = tbats_df, aes(Time, Forecast), color = "blue", linewidth = 1) +
+  labs(
+    title = "Observed vs Forecast: TBATS",
+    x = "Time",
+    y = "Flu % Positive"
+  ) +
+  theme_minimal()
+```
+
+# 5.  Model comparison
+
+```{r}
+############################################################
+# Final model comparison
+############################################################
+library(MuMIn)
+
+fc_sarima_base <- forecast(fit_sarima_base, h = h, xreg = xreg_base_test)
+fc_arimax_v1   <- forecast(fit_arimax_v1,   h = h, xreg = xreg_v1_test)
+fc_arimax_v2   <- forecast(fit_arimax_v2,   h = h, xreg = xreg_v2_test)
+
+acc_sarima   <- accuracy(fc_sarima_base, test_full)
+acc_arimax1  <- accuracy(fc_arimax_v1, test_full)
+acc_arimax2  <- accuracy(fc_arimax_v2, test_full)
+acc_tbats    <- accuracy(fc_tbats, test_full)
+acc_pure_sarima <- accuracy(fc_sarima_pure_auto, test_full)
+
+compare_models <- data.frame(
+  Model = c(
+    "SARIMA + COVID dummy (baseline)",
+    "ARIMAX v1: COVID + ILINet + ESSENCE",
+    "ARIMAX v2: v1 + ICU + pediatric deaths",
+    "Pure SARIMA",
+    "TBATS"
+  ),
+  
+  # Information criteria
+  AICc = c(
+    AICc(fit_sarima_base),
+    AICc(fit_arimax_v1),
+    AICc(fit_arimax_v2),
+    AICc(fit_sarima_pure_auto),
+    NA
+  ),
+  
+  BIC = c(
+    BIC(fit_sarima_base),
+    BIC(fit_arimax_v1),
+    BIC(fit_arimax_v2),
+    BIC(fit_sarima_pure_auto),
+    NA
+  ),
+  
+  # Forecast errors
+  RMSE = c(
+    acc_sarima[2,"RMSE"],
+    acc_arimax1[2,"RMSE"],
+    acc_arimax2[2,"RMSE"],
+    acc_pure_sarima[2,"RMSE"],
+    acc_tbats[2,"RMSE"]
+  ),
+  
+  MAE = c(
+    acc_sarima[2,"MAE"],
+    acc_arimax1[2,"MAE"],
+    acc_arimax2[2,"MAE"],
+    acc_pure_sarima[2,"MAE"],
+    acc_tbats[2,"MAE"]
+  ),
+  
+  MAPE = c(
+    acc_sarima[2,"MAPE"],
+    acc_arimax1[2,"MAPE"],
+    acc_arimax2[2,"MAPE"],
+    acc_pure_sarima[2,"MAPE"],
+    acc_tbats[2,"MAPE"]
+  )
+)
+
+compare_models
+```
+
+```{r}
+############################################################
+# Individual forecast plots
+############################################################
+library(ggplot2)
+
+plot_model_forecast <- function(fc_obj, model_name) {
+  
+  actual_df <- data.frame(
+    Time = time(test_full),
+    Value = as.numeric(test_full)
+  )
+  
+  forecast_df <- data.frame(
+    Time = time(fc_obj$mean),
+    Value = as.numeric(fc_obj$mean)
+  )
+  
+  ggplot() +
+    geom_line(data = actual_df,
+              aes(Time, Value),
+              color = "black",
+              linewidth = 1.2) +
+    
+    geom_line(data = forecast_df,
+              aes(Time, Value),
+              color = "blue",
+              linewidth = 1) +
+    
+    labs(
+      title = paste("Observed vs Forecast:", model_name),
+      x = "Time",
+      y = "Flu % Positive"
+    ) +
+    
+    theme_minimal()
+}
+
+# Generate plots
+plot_model_forecast(fc_sarima_pure_auto, "SARIMA")
+plot_model_forecast(fc_sarima_base, "SARIMA + COVID dummy")
+plot_model_forecast(fc_arimax_v1, "ARIMAX v1: COVID + ILINet + ESSENCE")
+plot_model_forecast(fc_arimax_v2, "ARIMAX v2: v1 + ICU + pediatric deaths")
+plot_model_forecast(fc_tbats, "TBATS")
+```
+
+# 6.  ARIMAX V2 Residual Diagnostics
+
+```{r}
+av2_summary <- data.frame(
+  model = "ARIMA v2",
+  order = paste0("(", paste(ao[c("p","d","q")], collapse=","), ")"),
+  seasonal = paste0("(", paste(ao[c("P","D","Q")], collapse=","), ")[52]"),
+  AIC  = AIC(auto_fit),
+  AICc = AICc_manual(auto_fit),
+  BIC  = BIC(auto_fit),
+  RMSE = auto_acc["Test set","RMSE"],
+  MAE  = auto_acc["Test set","MAE"],
+  LjungBox_p = auto_lb$p.value
+)
+
+print(auto_summary)
+fit_arimax_v2
+```
+
+```{r}
+checkresiduals(fit_arimax_v2)
+```
+
+The residual diagnostics indicate that the ARIMAX v2 model provides an adequate fit to the weekly influenza series. The Ljung–Box test yields a p-value of 0.107, which is above the conventional 0.05 significance level. Therefore, we fail to reject the null hypothesis that the residuals are independently distributed. This suggests that the model has successfully captured most of the serial dependence present in the data.
+
+The residual time series plot shows fluctuations around zero without clear remaining structure or systematic patterns. While occasional spikes appear, these are expected in epidemiological data due to irregular outbreak dynamics and reporting variability.
+
+The residual ACF plot further supports model adequacy, as nearly all autocorrelations lie within the 95% confidence bounds. This indicates that little meaningful autocorrelation remains after accounting for both the ARIMA dynamics and the external covariates included in ARIMAX v2.
+
+Finally, the residual histogram appears approximately symmetric and centered around zero, suggesting that the residual distribution is reasonably close to normal. Although perfect normality is not required for forecasting purposes, the absence of strong skewness or heavy tails supports the statistical validity of the model.
+
+Overall, these diagnostic results indicate that the ARIMAX v2 specification sufficiently captures the temporal structure of the influenza series and produces residuals that behave like white noise. This provides further evidence that the model is appropriate for forecasting influenza activity.
+
+# 7. ARIMAX V2 Monthly Robustness Check
+
+```{r}
+############################################################
+# Monthly ARIMAX v2 robustness check
+# (same naming style as the current Rmd)
+############################################################
+
+library(dplyr)
+library(lubridate)
+library(forecast)
+library(ggplot2)
+
+# ----------------------------------------------------------
+# 1) Build monthly covariates from the WEEKLY full covariate objects
+#    already used in the weekly ARIMAX section
+# ----------------------------------------------------------
+df_monthly_xreg <- data.frame(
+  month_start = floor_date(df_eda$WEEK_START, "month"),
+  covid   = as.numeric(covid_dummy_full),
+  ilinet  = as.numeric(ilinet_full),
+  essence = as.numeric(essence_full),
+  icu     = as.numeric(icu_full),
+  peds    = as.numeric(peds_full)
+) %>%
+  group_by(month_start) %>%
+  summarise(
+    covid   = round(mean(covid,   na.rm = TRUE)),   # step dummy -> monthly dummy
+    ilinet  = mean(ilinet,  na.rm = TRUE),
+    essence = mean(essence, na.rm = TRUE),
+    icu     = mean(icu,     na.rm = TRUE),
+    peds    = mean(peds,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(month_start)
+
+# Safety check: monthly covariates should align with df_monthly
+stopifnot(nrow(df_monthly_xreg) == nrow(df_monthly))
+stopifnot(all(df_monthly_xreg$month_start == df_monthly$month_start))
+
+# ----------------------------------------------------------
+# 2) Fill missing values (same spirit as your weekly fill_x)
+# ----------------------------------------------------------
+fill_x_m <- function(x) {
+  x <- as.numeric(x)
+  x <- forecast::na.interp(x)
+  x[is.na(x)] <- 0
+  return(x)
+}
+
+df_monthly_xreg <- df_monthly_xreg %>%
+  mutate(
+    covid   = fill_x_m(covid),
+    ilinet  = fill_x_m(ilinet),
+    essence = fill_x_m(essence),
+    icu     = fill_x_m(icu),
+    peds    = fill_x_m(peds)
+  )
+
+# ----------------------------------------------------------
+# 3) Convert to monthly ts objects
+# ----------------------------------------------------------
+covid_m_ts   <- ts(df_monthly_xreg$covid,   frequency = 12)
+ilinet_m_ts  <- ts(df_monthly_xreg$ilinet,  frequency = 12)
+essence_m_ts <- ts(df_monthly_xreg$essence, frequency = 12)
+icu_m_ts     <- ts(df_monthly_xreg$icu,     frequency = 12)
+peds_m_ts    <- ts(df_monthly_xreg$peds,    frequency = 12)
+
+# ----------------------------------------------------------
+# 4) Use the SAME monthly split points as y_month_model
+# ----------------------------------------------------------
+covid_m_train   <- window(covid_m_ts,   end   = time(y_month_model)[n_m - h_m])
+covid_m_test    <- window(covid_m_ts,   start = time(y_month_model)[n_m - h_m + 1])
+
+ilinet_m_train  <- window(ilinet_m_ts,  end   = time(y_month_model)[n_m - h_m])
+ilinet_m_test   <- window(ilinet_m_ts,  start = time(y_month_model)[n_m - h_m + 1])
+
+essence_m_train <- window(essence_m_ts, end   = time(y_month_model)[n_m - h_m])
+essence_m_test  <- window(essence_m_ts, start = time(y_month_model)[n_m - h_m + 1])
+
+icu_m_train     <- window(icu_m_ts,     end   = time(y_month_model)[n_m - h_m])
+icu_m_test      <- window(icu_m_ts,     start = time(y_month_model)[n_m - h_m + 1])
+
+peds_m_train    <- window(peds_m_ts,    end   = time(y_month_model)[n_m - h_m])
+peds_m_test     <- window(peds_m_ts,    start = time(y_month_model)[n_m - h_m + 1])
+
+# ----------------------------------------------------------
+# 5) Define monthly xreg matrices
+#    baseline = COVID only
+#    v2       = COVID + ILINet + ESSENCE + ICU + Peds
+# ----------------------------------------------------------
+xreg_m_base_train <- cbind(
+  covid = as.numeric(covid_m_train)
+)
+
+xreg_m_base_test <- cbind(
+  covid = as.numeric(covid_m_test)
+)
+
+xreg_m_v2_train <- cbind(
+  covid   = as.numeric(covid_m_train),
+  ilinet  = as.numeric(ilinet_m_train),
+  essence = as.numeric(essence_m_train),
+  icu     = as.numeric(icu_m_train),
+  peds    = as.numeric(peds_m_train)
+)
+
+xreg_m_v2_test <- cbind(
+  covid   = as.numeric(covid_m_test),
+  ilinet  = as.numeric(ilinet_m_test),
+  essence = as.numeric(essence_m_test),
+  icu     = as.numeric(icu_m_test),
+  peds    = as.numeric(peds_m_test)
+)
+
+
+# ----------------------------------------------------------
+# 7) Fit monthly ARIMAX v2
+#    Same monthly SARIMA skeleton + richer xreg
+# ----------------------------------------------------------
+fit_month_arimax_v2 <- Arima(
+  train_m,
+  order = c(1, 0, 0),
+  seasonal = list(order = c(0, 1, 1), period = 12),
+  include.constant = TRUE,
+  xreg = xreg_m_v2_train,
+  method = "CSS-ML",
+  lambda = lambda_m,
+  biasadj = TRUE
+)
+
+fc_month_arimax_v2 <- forecast(
+  fit_month_arimax_v2,
+  h = h_m,
+  xreg = xreg_m_v2_test
+)
+
+# ----------------------------------------------------------
+# 8) Accuracy comparison
+# ----------------------------------------------------------
+acc_month_arimax_v2 <- accuracy(fc_month_arimax_v2, test_m)
+
+get_test_row <- function(acc_mat) {
+  as.data.frame(acc_mat)[2, , drop = FALSE]
+}
+
+monthly_arimax_cmp <- rbind(
+  data.frame(Model = "Monthly SARIMA + COVID", get_test_row(auto_m_acc)),
+  data.frame(Model = "Monthly ARIMAX v2",      get_test_row(acc_month_arimax_v2))
+)
+
+monthly_arimax_cmp_out <- monthly_arimax_cmp[, c("Model", "RMSE", "MAE", "MAPE", "MASE")]
+print(monthly_arimax_cmp_out)
+
+# ----------------------------------------------------------
+# 9) AIC / BIC comparison
+# ----------------------------------------------------------
+monthly_ic_cmp <- data.frame(
+  Model = c("Monthly SARIMA + COVID", "Monthly ARIMAX v2"),
+  AIC   = c(AIC(auto_m), AIC(fit_month_arimax_v2)),
+  BIC   = c(BIC(auto_m), BIC(fit_month_arimax_v2))
+)
+
+print(monthly_ic_cmp)
+
+# ----------------------------------------------------------
+# 10) Observed vs Forecast plot
+# ----------------------------------------------------------
+actual_month_df <- data.frame(
+  Time   = time(test_m),
+  Actual = as.numeric(test_m)
+)
+
+base_month_df <- data.frame(
+  Time     = time(auto_m_fc$mean),
+  Forecast = as.numeric(auto_m_fc$mean),
+  Model    = "Monthly SARIMA + COVID"
+)
+
+arimax_v2_month_df <- data.frame(
+  Time     = time(fc_month_arimax_v2$mean),
+  Forecast = as.numeric(fc_month_arimax_v2$mean),
+  Model    = "Monthly ARIMAX v2"
+)
+
+forecast_month_df <- bind_rows(base_month_df, arimax_v2_month_df)
+
+
+# ----------------------------------------------------------
+# 11) Residual diagnostics for monthly ARIMAX v2
+# ----------------------------------------------------------
+summary(fit_month_arimax_v2)
+checkresiduals(fit_month_arimax_v2)
+```
+
+To further assess the robustness of our results, we re-estimated the model using a monthly aggregation of the influenza series. Temporal aggregation provides a useful robustness check because it reduces short-term weekly noise and allows us to examine whether the key modeling conclusions remain stable at a lower frequency.
+
+The monthly ARIMAX v2 model achieves lower RMSE and MAE than the monthly SARIMA model with only the COVID intervention term. In particular, RMSE decreases from 2.63 to 2.08 and MAE decreases from 1.79 to 1.57, indicating improved forecast accuracy when additional surveillance covariates are incorporated. Although the MAPE value is larger for ARIMAX v2, this metric can become unstable when the actual influenza positivity rate is very small, which frequently occurs during summer months. Therefore RMSE and MAE provide more reliable measures of model performance in this setting.
+
+Information criteria also favor the richer specification. The monthly ARIMAX v2 model produces substantially lower AIC and BIC values (AIC = 283.4 vs 301.2; BIC = 305.3 vs 310.9), suggesting that the improvement in fit justifies the additional covariates included in the model.
+
+Residual diagnostics further support model adequacy. The residual series fluctuates around zero without clear systematic patterns, and the residual ACF shows that most autocorrelations lie within the confidence bounds. In addition, the residual histogram appears approximately symmetric and centered near zero, indicating that the remaining errors are reasonably well behaved.
+
+Overall, the monthly robustness analysis supports the main findings of the weekly analysis. Even after temporal aggregation, incorporating additional surveillance indicators such as ILINet, ESSENCE, ICU admissions, and pediatric deaths improves forecasting performance. This suggests that the predictive value of these covariates is not limited to short-term weekly dynamics but also persists at the monthly level, reinforcing the robustness of the ARIMAX-based modeling approach.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+
+# =========================
+# 1. Monthly ARIMAX v2 forecast mean
+# =========================
+arimax_v2_mean <- as.numeric(fc_month_arimax_v2$mean)
+
+# =========================
+# 2. Rebuild actual monthly series
+# =========================
+df_month <- df_eda %>%
+  mutate(month = floor_date(WEEK_START, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    flu = mean(LAB_FLU_PCT_POSITIVE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Actual test values
+h <- h_m
+actual <- df_month$flu[(nrow(df_month) - h + 1):nrow(df_month)]
+test_dates <- df_month$month[(nrow(df_month) - h + 1):nrow(df_month)]
+
+# =========================
+# 3. Build plotting dataframe
+# =========================
+plot_df <- data.frame(
+  Date          = test_dates,
+  Actual        = actual,
+  SARIMA        = sarima_mean,
+  ETS           = ets_mean,
+  Naive         = naive_mean,
+  SeasonalNaive = snaive_mean,
+  ARIMAXv2      = arimax_v2_mean
+)
+
+plot_df_long <- plot_df %>%
+  pivot_longer(
+    cols = -Date,
+    names_to = "Series",
+    values_to = "Value"
+  )
+
+# =========================
+# 4. Plot
+# =========================
+ggplot(plot_df_long, aes(x = Date, y = Value, color = Series)) +
+  geom_line(aes(linewidth = Series)) +
+  scale_linewidth_manual(
+    values = c(
+      "Actual" = 1.3,
+      "ETS" = 1.0,
+      "Naive" = 1.0,
+      "SARIMA" = 1.0,
+      "SeasonalNaive" = 1.0,
+      "ARIMAXv2" = 1.0
+    ),
+    guide = "none"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Actual" = "black",
+      "ETS" = "#d95f02",
+      "Naive" = "#377eb8",
+      "SARIMA" = "#32CD32",
+      "SeasonalNaive" = "#7570b3",
+      "ARIMAXv2" = "#e7298a"
+    )
+  ) +
+  labs(
+    title = "Monthly Influenza Forecast Comparison",
+    x = "Month",
+    y = "% Influenza Positive",
+    color = "Series"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 22, face = "plain"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 15)
+  )
+```
+
+```{r}
+get_test_metrics <- function(acc){
+  acc["Test set", c("RMSE","MAE","MAPE","MASE")]
+}
+
+error_table <- rbind(
+  SARIMA        = get_test_metrics(auto_m_acc),
+  ETS           = get_test_metrics(ets_m_acc),
+  Naive         = get_test_metrics(naive_m_acc),
+  SeasonalNaive = get_test_metrics(snaive_m_acc),
+  ARIMAX_v2     = get_test_metrics(acc_month_arimax_v2)
+)
+
+print(error_table)
+```
+
+# 6. CV for Best Model: ARIMAX v2
+
+```{r, warning=FALSE}
+y_full_ts  <- ts(y_full_pos, frequency = 52)
+
+
+cv_expanding_arimax_v2 <- function(y, xreg,
+                                   m,
+                                   order,
+                                   seas_order,
+                                   horizons = c(4,8,12),
+                                   initial = NULL,
+                                   include.constant = TRUE,
+                                   method = "CSS-ML",
+                                   lambda = NULL,
+                                   biasadj = TRUE) {
+
+  hmax <- max(horizons)
+  n <- length(y)
+  if (is.null(initial)) initial <- floor(0.6 * n)
+
+  origins <- initial:(n - hmax)
+  n_origins <- length(origins)
+  if (n_origins <= 0) stop("Not enough data for chosen initial window and horizon.")
+
+  # safe xreg slicing (vector or matrix/data.frame/ts)
+  x_slice <- function(X, idx) {
+    if (is.null(dim(X))) return(X[idx])
+    X[idx, , drop = FALSE]
+  }
+
+  out <- vector("list", n_origins * length(horizons))
+  pos <- 0L
+
+  pb <- txtProgressBar(min = 0, max = n_origins, style = 3)
+
+  for (k in seq_along(origins)) {
+    i <- origins[k]
+
+    fit <- tryCatch(
+      Arima(
+        y[1:i],
+        order = order,
+        seasonal = list(order = seas_order, period = m),
+        include.constant = include.constant,
+        xreg = x_slice(xreg, 1:i),
+        method = method,
+        lambda = lambda,
+        biasadj = biasadj
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit)) { setTxtProgressBar(pb, k); next }
+
+    fc <- tryCatch(
+      forecast(fit, h = hmax, xreg = x_slice(xreg, (i+1):(i+hmax))),
+      error = function(e) NULL
+    )
+
+    if (is.null(fc)) { setTxtProgressBar(pb, k); next }
+
+    for (h in horizons) {
+      pos <- pos + 1L
+      err <- as.numeric(y[i + h] - fc$mean[h])
+      out[[pos]] <- data.frame(
+        Method = "Expanding",
+        OriginIndex = i,
+        Horizon = h,
+        Error = err,
+        SqError = err^2
+      )
+    }
+
+    setTxtProgressBar(pb, k)
+  }
+  close(pb)
+
+  dplyr::bind_rows(out[1:pos])
+}
+
+# =========================
+# Step 2b) Run expanding CV
+# =========================
+cv_exp_v2 <- cv_expanding_arimax_v2(
+  y = y_full_ts,
+  xreg = xreg_v2_train,
+  m = m,
+  order = chosen_spec$order,
+  seas_order = chosen_spec$seasonal,
+  horizons = c(4, 8, 12),
+  initial = floor(0.6 * length(y_full_ts)),
+  include.constant = TRUE,
+  method = "CSS",
+  lambda = lambda_bc,
+  biasadj = TRUE
+)
+
+# Quick check: RMSE by horizon (expanding only)
+cv_exp_v2 %>%
+  dplyr::group_by(Horizon) %>%
+  dplyr::summarise(RMSE = sqrt(mean(SqError, na.rm = TRUE)), .groups = "drop") %>%
+  print()
+```
+
+```{r, warning=FALSE}
+cv_sliding_arimax_v2 <- function(y, xreg,
+                                 m,
+                                 order,
+                                 seas_order,
+                                 horizons = c(4,8,12),
+                                 window = NULL,
+                                 include.constant = TRUE,
+                                 method = "CSS-ML",
+                                 lambda = NULL,
+                                 biasadj = TRUE) {
+
+  hmax <- max(horizons)
+  n <- length(y)
+  if (is.null(window)) window <- floor(0.6 * n)
+  if (window + hmax > n) stop("Not enough data for chosen window and horizon.")
+
+  origins <- window:(n - hmax)
+  n_origins <- length(origins)
+  if (n_origins <= 0) stop("Not enough data for chosen window and horizon.")
+
+  x_slice <- function(X, idx) {
+    if (is.null(dim(X))) return(X[idx])
+    X[idx, , drop = FALSE]
+  }
+
+  out <- vector("list", n_origins * length(horizons))
+  pos <- 0L
+  pb <- txtProgressBar(min = 0, max = n_origins, style = 3)
+
+  for (k in seq_along(origins)) {
+    i <- origins[k]
+    train_idx <- (i - window + 1):i
+
+    fit <- tryCatch(
+      forecast::Arima(
+        y[train_idx],
+        order = order,
+        seasonal = list(order = seas_order, period = m),
+        include.constant = include.constant,
+        xreg = x_slice(xreg, train_idx),
+        method = method,
+        lambda = lambda,
+        biasadj = biasadj
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) { setTxtProgressBar(pb, k); next }
+
+    fc <- tryCatch(
+      forecast::forecast(fit, h = hmax, xreg = x_slice(xreg, (i+1):(i+hmax))),
+      error = function(e) NULL
+    )
+    if (is.null(fc)) { setTxtProgressBar(pb, k); next }
+
+    for (h in horizons) {
+      pos <- pos + 1L
+      err <- as.numeric(y[i + h] - fc$mean[h])
+      out[[pos]] <- data.frame(
+        Method = "Sliding",
+        OriginIndex = i,   # ✅ end-of-training-window index (time index)
+        Horizon = h,
+        Error = err,
+        SqError = err^2
+      )
+    }
+
+    setTxtProgressBar(pb, k)
+  }
+  close(pb)
+
+  dplyr::bind_rows(out[1:pos])
+}
+cv_slide_v2 <- cv_sliding_arimax_v2(
+  y = y_full_ts,
+  xreg = xreg_v2_train,
+  m = m,
+  order = chosen_spec$order,
+  seas_order = chosen_spec$seasonal,
+  horizons = c(4, 8, 12),
+  window = floor(0.6 * length(y_full_ts)),
+  include.constant = TRUE,
+  method = "CSS",
+  lambda = lambda_bc,
+  
+  biasadj = TRUE
+)
+
+cv_slide_v2 %>%
+  dplyr::group_by(Horizon) %>%
+  dplyr::summarise(
+    RMSE = sqrt(mean(SqError, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  print()
+```
+
+```{r}
+
+  # Combine expanding + sliding (make sure Method exists and differs)
+cv_exp_v2$Method   <- "Expanding"
+cv_slide_v2$Method <- "Sliding"
+cv_arimax_v2_all <- dplyr::bind_rows(cv_exp_v2, cv_slide_v2)
+
+rolling_rmse_stability_arimax_v2 <- function(cv_df, k = 26) {
+  cv_df %>%
+    dplyr::group_by(Method, Horizon) %>%
+    dplyr::arrange(OriginIndex, .by_group = TRUE) %>%
+    dplyr::mutate(
+      RollingRMSE = zoo::rollapply(
+        SqError,
+        width = k,
+        FUN = function(z) sqrt(mean(z, na.rm = TRUE)),
+        fill = NA,
+        align = "right"
+      )
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(
+      x = OriginIndex, y = RollingRMSE, color = Method, group = Method
+    )) +
+    ggplot2::geom_line(linewidth = 0.8, na.rm = TRUE) +
+    ggplot2::facet_wrap(~ Horizon, scales = "free_y") +
+    ggplot2::labs(
+      title = paste0("ARIMAX v2 Rolling RMSE Stability (window = ", k, " origins)"),
+      x = "Origin index (end of training window)",
+      y = "Rolling RMSE"
+    ) +
+    ggplot2::theme_minimal()
+}
+
+# Plot
+rolling_rmse_stability_arimax_v2(cv_arimax_v2_all, k = 26)
+```
+
+```{r}
+cum_rmse_convergence_arimax_v2 <- function(cv_df) {
+
+  cv_df %>%
+    dplyr::mutate(
+      OriginIndex = as.integer(OriginIndex),
+      SqError = as.numeric(SqError),
+      SqError_ok = dplyr::if_else(is.finite(SqError), SqError, NA_real_)
+    ) %>%
+    dplyr::group_by(Method, Horizon) %>%
+    dplyr::arrange(OriginIndex, .by_group = TRUE) %>%
+    dplyr::mutate(
+      n_eff = cumsum(!is.na(SqError_ok)),
+      sse   = cumsum(dplyr::coalesce(SqError_ok, 0)),
+      CumRMSE = sqrt(sse / n_eff)
+    ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = OriginIndex, y = CumRMSE, color = Method)) +
+    ggplot2::geom_line(linewidth = 0.9, na.rm = TRUE) +
+    ggplot2::facet_wrap(~ Horizon, scales = "free_y") +
+    ggplot2::labs(
+      title = "Cumulative RMSE Convergence (ARIMAX v2: Expanding vs Sliding)",
+      x = "Origin index (end of training window)",
+      y = "Cumulative RMSE"
+    ) +
+    ggplot2::theme_minimal()
+}
+
+cum_rmse_convergence_arimax_v2(cv_arimax_v2_all)
+```
+
+```{r}
+
+roll_all <- dplyr::bind_rows(cv_exp_v2, cv_slide_v2) %>%
+  dplyr::mutate(
+    Method = factor(Method, levels = c("Expanding","Sliding")),
+    Horizon = as.integer(Horizon)
+  )
+
+# Option A (recommended): CV RMSE = sqrt(mean SqError) across all origins
+summary_by_h <- roll_all %>%
+  dplyr::group_by(Method, Horizon) %>%
+  dplyr::summarise(
+    RMSE = sqrt(mean(SqError, na.rm = TRUE)),
+    N = sum(!is.na(SqError)),
+    .groups = "drop"
+  )
+ggplot(summary_by_h, aes(x = Method, y = RMSE, fill = Method)) +
+  geom_col(width = 0.7) +
+  facet_wrap(~ Horizon, scales = "free_y") +
+  labs(
+    title = "ARIMAX v2: RMSE Comparison (Expanding vs Sliding)",
+    x = "CV Method",
+    y = "RMSE",
+    fill = "Method"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Expanding" = "#F8766D",
+      "Sliding"   = "#00BFC4"
+    )
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+cv_arimax_v2_all %>%
+  dplyr::mutate(Error = sqrt(SqError)) %>%
+  ggplot2::ggplot(ggplot2::aes(x = factor(Horizon), y = abs(Error), fill = Method)) +
+  ggplot2::geom_boxplot(outlier.alpha = 0.3) +
+  ggplot2::labs(
+    title = "Absolute Forecast Error Distribution by Horizon (ARIMAX v2)",
+    x = "Horizon (weeks)",
+    y = "|Forecast error|",
+    fill = "CV Method"
+  ) +
+  ggplot2::theme_minimal()
+
+```
+
+Rolling RMSE Stability
+
+The rolling RMSE plot evaluates the short-term stability of forecast accuracy across time. Both expanding and sliding window approaches show similar temporal patterns, with errors increasing sharply during certain periods, indicating times when influenza dynamics became harder to predict. However, the sliding window consistently produces slightly lower rolling RMSE than the expanding window, suggesting that models trained on more recent data adapt better to evolving patterns in influenza activity.
+
+Cumulative RMSE Convergence
+
+The cumulative RMSE curves illustrate how cross-validation error stabilizes as more rolling origins are included. Early in the evaluation period the RMSE fluctuates substantially due to limited observations, but it gradually converges as additional forecasts are incorporated. Across all horizons, the sliding window maintains a lower cumulative RMSE than the expanding window, indicating that using a fixed-length recent training window yields more reliable and stable forecast performance.
+
+RMSE Comparison (Expanding vs Sliding)
+
+The RMSE comparison summarizes cross-validation performance across forecast horizons. For all horizons (4, 8, and 12 weeks), the sliding window approach achieves lower RMSE than the expanding window. Forecast accuracy decreases as the horizon increases, which is expected due to increasing uncertainty in longer-term predictions. Overall, the results indicate that restricting training to more recent observations improves ARIMAX v2 forecast accuracy.
+
+Absolute Forecast Error Distribution
+
+The boxplots show the distribution of absolute forecast errors across horizons for both cross-validation strategies. Errors increase and become more dispersed as the forecast horizon grows, reflecting greater uncertainty in longer-term predictions. The sliding window generally exhibits slightly lower median errors and tighter interquartile ranges compared to the expanding window, reinforcing the conclusion that models trained on recent data produce more accurate and consistent forecasts.
