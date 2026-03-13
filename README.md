@@ -220,6 +220,8 @@ Key results:
 ## Extended Models
 
 Several extended forecasting models were also explored.
+<img width="984" height="547" alt="Screenshot 2026-03-13 at 2 33 38 PM" src="https://github.com/user-attachments/assets/4c2b9852-b04b-4e9c-bf63-0cd9389903e9" />
+
 
 ### ARIMAX Models
 
@@ -245,6 +247,7 @@ TBATS(0.259,{2,2},-,{<52,6>})
 While TBATS achieved competitive performance, it cannot incorporate external predictors and therefore lacks the interpretability of ARIMAX models.
 
 ---
+<img width="984" height="553" alt="Screenshot 2026-03-13 at 2 34 04 PM" src="https://github.com/user-attachments/assets/b8ced69d-971e-4dee-becd-4f2ef9acba8b" />
 
 ## Key Findings
 
