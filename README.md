@@ -249,7 +249,7 @@ While TBATS achieved competitive performance, it cannot incorporate external pre
 ---
 <img width="984" height="553" alt="Screenshot 2026-03-13 at 2 34 04 PM" src="https://github.com/user-attachments/assets/b8ced69d-971e-4dee-becd-4f2ef9acba8b" />
 
-## Key Findings
+## Key Findings 
 
 Several important insights emerge from the analysis:
 
