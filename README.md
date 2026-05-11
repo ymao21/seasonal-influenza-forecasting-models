@@ -115,7 +115,6 @@ This captures the annual influenza cycle and prepares the data for ARIMA-type mo
 
 ---
 
-<img width="870" height="487" alt="Screenshot 2026-03-13 at 2 30 24 PM" src="https://github.com/user-attachments/assets/f61209be-b76e-4dad-b0b2-921d4af33a15" />
 
 
 ### 4. Model Construction
@@ -155,9 +154,6 @@ Additional model details:
 - log-likelihood = −569.38  
 
 ---
-<img width="865" height="486" alt="Screenshot 2026-03-13 at 2 30 43 PM" src="https://github.com/user-attachments/assets/de562410-1623-4398-9599-5d0e43431967" />
-
-<img width="852" height="490" alt="Screenshot 2026-03-13 at 2 30 49 PM" src="https://github.com/user-attachments/assets/1d1287a3-0c6c-4062-8b3e-687483e0951c" />
 
 ## COVID Structural Adjustment
 
@@ -220,7 +216,6 @@ Key results:
 ## Extended Models
 
 Several extended forecasting models were also explored.
-<img width="984" height="547" alt="Screenshot 2026-03-13 at 2 33 38 PM" src="https://github.com/user-attachments/assets/4c2b9852-b04b-4e9c-bf63-0cd9389903e9" />
 
 
 ### ARIMAX Models
@@ -247,7 +242,6 @@ TBATS(0.259,{2,2},-,{<52,6>})
 While TBATS achieved competitive performance, it cannot incorporate external predictors and therefore lacks the interpretability of ARIMAX models.
 
 ---
-<img width="984" height="553" alt="Screenshot 2026-03-13 at 2 34 04 PM" src="https://github.com/user-attachments/assets/b8ced69d-971e-4dee-becd-4f2ef9acba8b" />
 
 ## Key Findings 
 
